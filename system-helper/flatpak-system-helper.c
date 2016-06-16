@@ -192,7 +192,7 @@ handle_deploy (FlatpakSystemHelper   *object,
       return TRUE;
     }
 
-  if (!flatpak_dir_ensure_repo (system, NULL, &error))
+  if (!flatpak_dir_ensure_repo (system, FALSE, NULL, &error))
     {
       g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
                                              "Can't open system repo %s", error->message);
@@ -305,7 +305,7 @@ handle_deploy_appstream (FlatpakSystemHelper   *object,
       return TRUE;
     }
 
-  if (!flatpak_dir_ensure_repo (system, NULL, &error))
+  if (!flatpak_dir_ensure_repo (system, FALSE, NULL, &error))
     {
       g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
                                              "Can't open system repo %s", error->message);
@@ -368,7 +368,7 @@ handle_uninstall (FlatpakSystemHelper *object,
       return TRUE;
     }
 
-  if (!flatpak_dir_ensure_repo (system, NULL, &error))
+  if (!flatpak_dir_ensure_repo (system, FALSE, NULL, &error))
     {
       g_dbus_method_invocation_return_gerror  (invocation, error);
       return TRUE;
@@ -468,7 +468,7 @@ handle_configure_remote (FlatpakSystemHelper *object,
       return TRUE;
     }
 
-  if (!flatpak_dir_ensure_repo (system, NULL, &error))
+  if (!flatpak_dir_ensure_repo (system, FALSE, NULL, &error))
     {
       g_dbus_method_invocation_return_gerror  (invocation, error);
       return TRUE;

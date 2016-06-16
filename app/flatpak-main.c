@@ -213,12 +213,14 @@ flatpak_option_context_parse (GOptionContext     *context,
     {
       dir = flatpak_dir_get (opt_user);
 
-      if (!flatpak_dir_ensure_path (dir, cancellable, error))
-        return FALSE;
+      if (!(flags & FLATPAK_BUILTIN_FLAG_NO_REPO))
+        {
+          if (!flatpak_dir_ensure_path (dir, cancellable, error))
+            return FALSE;
 
-      if (!(flags & FLATPAK_BUILTIN_FLAG_NO_REPO) &&
-          !flatpak_dir_ensure_repo (dir, cancellable, error))
-        return FALSE;
+          if (!flatpak_dir_ensure_repo (dir, FALSE, cancellable, error))
+            return FALSE;
+        }
     }
 
   if (opt_verbose)

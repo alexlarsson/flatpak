@@ -62,7 +62,9 @@ flatpak_builtin_ls_remote (int argc, char **argv, GCancellable *cancellable, GEr
 
   context = g_option_context_new (" REMOTE - Show available runtimes and applications");
 
-  if (!flatpak_option_context_parse (context, options, &argc, &argv, 0, &dir, cancellable, error))
+  if (!flatpak_option_context_parse (context, options, &argc, &argv,
+                                     FLATPAK_BUILTIN_FLAG_NO_REPO,
+                                     &dir, cancellable, error))
     return FALSE;
 
   if (!opt_app && !opt_runtime)

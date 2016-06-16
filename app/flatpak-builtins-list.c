@@ -90,7 +90,7 @@ print_installed_refs (gboolean app, gboolean runtime, gboolean print_system, gbo
     {
       user_dir = flatpak_dir_get (TRUE);
 
-      if (flatpak_dir_ensure_repo (user_dir, cancellable, NULL))
+      if (flatpak_dir_ensure_repo (user_dir, FALSE, cancellable, NULL))
         {
           if (app && !flatpak_dir_list_refs (user_dir, "app", &user_app, cancellable, error))
             return FALSE;
@@ -102,7 +102,7 @@ print_installed_refs (gboolean app, gboolean runtime, gboolean print_system, gbo
   if (print_system)
     {
       system_dir = flatpak_dir_get (FALSE);
-      if (flatpak_dir_ensure_repo (system_dir, cancellable, NULL))
+      if (flatpak_dir_ensure_repo (system_dir, FALSE, cancellable, NULL))
         {
           if (app && !flatpak_dir_list_refs (system_dir, "app", &system_app, cancellable, error))
             return FALSE;

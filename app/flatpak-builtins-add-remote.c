@@ -151,8 +151,14 @@ load_keys (GCancellable *cancellable,
 static GKeyFile *
 get_config_from_opts (FlatpakDir *dir, const char *remote_name)
 {
-  GKeyFile *config = ostree_repo_copy_config (flatpak_dir_get_repo (dir));
+  OstreeRepo *repo = flatpak_dir_get_repo (dir);
+  GKeyFile *config;
   g_autofree char *group = g_strdup_printf ("remote \"%s\"", remote_name);
+
+  if (repo)
+    config = ostree_repo_copy_config (repo);
+  else
+    config = g_key_file_new ();
 
   if (opt_no_gpg_verify)
     {
@@ -266,7 +272,7 @@ flatpak_builtin_add_remote (int argc, char **argv,
 
   g_option_context_add_main_entries (context, common_options, NULL);
 
-  if (!flatpak_option_context_parse (context, add_options, &argc, &argv, 0, &dir, cancellable, error))
+  if (!flatpak_option_context_parse (context, add_options, &argc, &argv, FLATPAK_BUILTIN_FLAG_NO_REPO, &dir, cancellable, error))
     return FALSE;
 
   if (opt_from)
@@ -369,7 +375,9 @@ flatpak_builtin_modify_remote (int argc, char **argv, GCancellable *cancellable,
 
   g_option_context_add_main_entries (context, common_options, NULL);
 
-  if (!flatpak_option_context_parse (context, modify_options, &argc, &argv, 0, &dir, cancellable, error))
+  if (!flatpak_option_context_parse (context, modify_options, &argc, &argv,
+                                     FLATPAK_BUILTIN_FLAG_NO_REPO,
+                                     &dir, cancellable, error))
     return FALSE;
 
   if (argc < 2)

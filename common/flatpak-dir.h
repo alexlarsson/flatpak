@@ -184,6 +184,7 @@ gboolean    flatpak_dir_use_child_repo (FlatpakDir *self);
 gboolean    flatpak_dir_ensure_system_child_repo (FlatpakDir *self,
                                                   GError    **error);
 gboolean    flatpak_dir_ensure_repo (FlatpakDir   *self,
+                                     gboolean      allow_no_repo,
                                      GCancellable *cancellable,
                                      GError      **error);
 gboolean    flatpak_dir_mark_changed (FlatpakDir *self,

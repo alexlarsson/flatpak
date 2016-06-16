@@ -49,7 +49,9 @@ flatpak_builtin_delete_remote (int argc, char **argv, GCancellable *cancellable,
 
   g_option_context_add_main_entries (context, delete_options, NULL);
 
-  if (!flatpak_option_context_parse (context, NULL, &argc, &argv, 0, &dir, cancellable, error))
+  if (!flatpak_option_context_parse (context, NULL, &argc, &argv,
+                                     FLATPAK_BUILTIN_FLAG_NO_REPO,
+                                     &dir, cancellable, error))
     return FALSE;
 
   if (argc < 2)

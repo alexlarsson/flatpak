@@ -107,7 +107,9 @@ flatpak_builtin_update (int           argc,
 
   context = g_option_context_new ("[NAME [BRANCH]] - Update an application or runtime");
 
-  if (!flatpak_option_context_parse (context, options, &argc, &argv, 0, &dir, cancellable, error))
+  if (!flatpak_option_context_parse (context, options, &argc, &argv,
+                                     FLATPAK_BUILTIN_FLAG_NO_REPO,
+                                     &dir, cancellable, error))
     return FALSE;
 
   if (argc < 1)
