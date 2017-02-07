@@ -275,6 +275,7 @@ builder_cache_checkout (BuilderCache *self, const char *commit, GError **error)
   g_autoptr(GFile) root = NULL;
   g_autoptr(GFileInfo) file_info = NULL;
   g_autoptr(GError) my_error = NULL;
+  OstreeRepoCheckoutMode mode = OSTREE_REPO_CHECKOUT_MODE_NONE;
 
   if (!ostree_repo_read_commit (self->repo, commit, &root, NULL, NULL, error))
     return FALSE;
@@ -292,14 +293,23 @@ builder_cache_checkout (BuilderCache *self, const char *commit, GError **error)
       return FALSE;
     }
 
-  /* We check out without user mode, not necessarily because we care
-     about uids not owned by the user (they are all from the build,
-     so should be creatable by the user, but because we want to
-     force the checkout to not use hardlinks. Hard links into the
-     cache are not safe, as the build could mutate these. */
-  if (!ostree_repo_checkout_tree (self->repo,
-                                  OSTREE_REPO_CHECKOUT_MODE_NONE,
-                                  OSTREE_REPO_CHECKOUT_OVERWRITE_NONE,
+  if (!flatpak_mkdir_p (self->app_dir, NULL, error))
+    return FALSE;
+
+  if (!builder_context_enable_rofiles (self->context, error))
+    return FALSE;
+
+  /* If rofiles-fuse is disabled, we check out without user mode, not
+     necessarily because we care about uids not owned by the user
+     (they are all from the build, so should be creatable by the user,
+     but because we want to force the checkout to not use
+     hardlinks. Hard links into the cache without rofiles-fuse are not
+     safe, as the build could mutate the cache. */
+  if (builder_context_get_rofiles_active (self->context))
+    mode = OSTREE_REPO_CHECKOUT_MODE_USER;
+
+  if (!ostree_repo_checkout_tree (self->repo, mode,
+                                  OSTREE_REPO_CHECKOUT_OVERWRITE_UNION_FILES,
                                   self->app_dir,
                                   OSTREE_REPO_FILE (root), file_info,
                                   NULL, error))
@@ -426,6 +436,10 @@ builder_cache_commit (BuilderCache *self,
     return FALSE;
 
   if (!ostree_repo_prepare_transaction (self->repo, NULL, NULL, error))
+    return FALSE;
+
+  if (builder_context_get_rofiles_active (self->context) &&
+      !ostree_repo_scan_hardlinks (self->repo, NULL, error))
     return FALSE;
 
   mtree = ostree_mutable_tree_new ();
