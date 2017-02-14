@@ -431,6 +431,8 @@ builder_context_enable_rofiles (BuilderContext *self,
   g_autoptr(GFile) rofiles_dir = NULL;
   g_autofree char *tmpdir_name = NULL;
   char *argv[] = { "rofiles-fuse",
+                   "-o",
+                   "kernel_cache,entry_timeout=60,attr_timeout=60",
                    (char *)flatpak_file_get_path_cached (self->app_dir),
                    NULL,
                    NULL };
@@ -457,9 +459,9 @@ builder_context_enable_rofiles (BuilderContext *self,
 
   rofiles_dir = g_file_get_child (rofiles_base, tmpdir_name);
 
-  argv[2] = (char *)flatpak_file_get_path_cached (rofiles_dir);
+  argv[4] = (char *)flatpak_file_get_path_cached (rofiles_dir);
 
-  g_debug ("starting: rofiles-fuse %s %s", argv[1], argv[2]);
+  g_debug ("starting: rofiles-fuse %s %s", argv[1], argv[4]);
   if (!g_spawn_sync (NULL, (char **)argv, NULL, G_SPAWN_SEARCH_PATH | G_SPAWN_CLOEXEC_PIPES, NULL, NULL, NULL, NULL, &exit_status, error))
     {
       g_prefix_error (error, "Can't spawn rofiles-fuse");
