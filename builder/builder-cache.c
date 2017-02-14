@@ -270,7 +270,7 @@ builder_cache_get_current (BuilderCache *self)
 }
 
 static gboolean
-builder_cache_checkout (BuilderCache *self, const char *commit, GError **error)
+builder_cache_checkout (BuilderCache *self, const char *commit, gboolean delete_dir, GError **error)
 {
   g_autoptr(GFile) root = NULL;
   g_autoptr(GFileInfo) file_info = NULL;
@@ -286,15 +286,18 @@ builder_cache_checkout (BuilderCache *self, const char *commit, GError **error)
   if (file_info == NULL)
     return FALSE;
 
-  if (!g_file_delete (self->app_dir, NULL, &my_error) &&
-      !g_error_matches (my_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
+  if (delete_dir)
     {
-      g_propagate_error (error, g_steal_pointer (&my_error));
-      return FALSE;
-    }
+      if (!g_file_delete (self->app_dir, NULL, &my_error) &&
+          !g_error_matches (my_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
+        {
+          g_propagate_error (error, g_steal_pointer (&my_error));
+          return FALSE;
+        }
 
-  if (!flatpak_mkdir_p (self->app_dir, NULL, error))
-    return FALSE;
+      if (!flatpak_mkdir_p (self->app_dir, NULL, error))
+        return FALSE;
+    }
 
   if (!builder_context_enable_rofiles (self->context, error))
     return FALSE;
@@ -316,9 +319,10 @@ builder_cache_checkout (BuilderCache *self, const char *commit, GError **error)
     return FALSE;
 
   /* There is a bug in ostree (https://github.com/ostreedev/ostree/issues/326) that
-     causes it to not reset mtime to 0 in this case (mismatching modes). So
-     we do that manually */
-  if (!flatpak_zero_mtime (AT_FDCWD, flatpak_file_get_path_cached (self->app_dir),
+     causes it to not reset mtime to 0 in themismatching modes case. So we do that
+     manually */
+  if (mode == OSTREE_REPO_CHECKOUT_MODE_NONE &&
+      !flatpak_zero_mtime (AT_FDCWD, flatpak_file_get_path_cached (self->app_dir),
                            NULL, error))
     return FALSE;
 
@@ -342,7 +346,7 @@ builder_cache_ensure_checkout (BuilderCache *self)
       g_autoptr(GError) error = NULL;
       g_print ("Everything cached, checking out from cache\n");
 
-      if (!builder_cache_checkout (self, self->last_parent, &error))
+      if (!builder_cache_checkout (self, self->last_parent, TRUE, &error))
         g_error ("Failed to check out cache: %s", error->message);
     }
 
@@ -404,7 +408,7 @@ checkout:
       g_autoptr(GError) error = NULL;
       g_print ("Cache miss, checking out last cache hit\n");
 
-      if (!builder_cache_checkout (self, self->last_parent, &error))
+      if (!builder_cache_checkout (self, self->last_parent, TRUE, &error))
         g_error ("Failed to check out cache: %s", error->message);
     }
 
@@ -464,6 +468,11 @@ builder_cache_commit (BuilderCache *self,
   ostree_repo_transaction_set_ref (self->repo, NULL, ref, commit_checksum);
 
   if (!ostree_repo_commit_transaction (self->repo, NULL, NULL, error))
+    goto out;
+
+  /* Check out the just commited cache so we hardlinks to the cache */
+  if (builder_context_get_use_rofiles (self->context) &&
+      !builder_cache_checkout (self, commit_checksum, FALSE, error))
     goto out;
 
   g_free (self->last_parent);

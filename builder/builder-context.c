@@ -439,7 +439,7 @@ builder_context_enable_rofiles (BuilderContext *self,
   gint exit_status;
   pid_t child;
 
-  if (!self->use_rofiles)
+  if (!self->use_rofiles || self->rofiles_dir != NULL)
     return TRUE;
 
   rofiles_base = g_file_get_child (self->state_dir, "rofiles");
