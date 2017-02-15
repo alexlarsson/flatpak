@@ -48,6 +48,7 @@ struct BuilderCache
   char       *last_parent;
   OstreeRepo *repo;
   gboolean    disabled;
+  OstreeRepoDevInoCache *devino_to_csum_cache;
 };
 
 typedef struct
@@ -82,6 +83,9 @@ builder_cache_finalize (GObject *object)
   g_free (self->stage);
   if (self->unused_stages)
     g_hash_table_unref (self->unused_stages);
+
+  if (self->devino_to_csum_cache)
+    ostree_repo_devino_cache_unref (self->devino_to_csum_cache);
 
   G_OBJECT_CLASS (builder_cache_parent_class)->finalize (object);
 }
@@ -177,6 +181,7 @@ static void
 builder_cache_init (BuilderCache *self)
 {
   self->checksum = g_checksum_new (G_CHECKSUM_SHA256);
+  self->devino_to_csum_cache = ostree_repo_devino_cache_new ();
 }
 
 BuilderCache *
@@ -272,19 +277,9 @@ builder_cache_get_current (BuilderCache *self)
 static gboolean
 builder_cache_checkout (BuilderCache *self, const char *commit, gboolean delete_dir, GError **error)
 {
-  g_autoptr(GFile) root = NULL;
-  g_autoptr(GFileInfo) file_info = NULL;
   g_autoptr(GError) my_error = NULL;
   OstreeRepoCheckoutMode mode = OSTREE_REPO_CHECKOUT_MODE_NONE;
-
-  if (!ostree_repo_read_commit (self->repo, commit, &root, NULL, NULL, error))
-    return FALSE;
-
-  file_info = g_file_query_info (root, OSTREE_GIO_FAST_QUERYINFO,
-                                 G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
-                                 NULL, error);
-  if (file_info == NULL)
-    return FALSE;
+  OstreeRepoCheckoutAtOptions options = { 0, };
 
   if (delete_dir)
     {
@@ -311,11 +306,13 @@ builder_cache_checkout (BuilderCache *self, const char *commit, gboolean delete_
   if (builder_context_get_rofiles_active (self->context))
     mode = OSTREE_REPO_CHECKOUT_MODE_USER;
 
-  if (!ostree_repo_checkout_tree (self->repo, mode,
-                                  OSTREE_REPO_CHECKOUT_OVERWRITE_UNION_FILES,
-                                  self->app_dir,
-                                  OSTREE_REPO_FILE (root), file_info,
-                                  NULL, error))
+  options.mode = mode;
+  options.overwrite_mode = OSTREE_REPO_CHECKOUT_OVERWRITE_UNION_FILES;
+  options.devino_to_csum_cache = self->devino_to_csum_cache;
+
+  if (!ostree_repo_checkout_at (self->repo, &options,
+                                AT_FDCWD, flatpak_file_get_path_cached (self->app_dir),
+                                commit, NULL, error))
     return FALSE;
 
   /* There is a bug in ostree (https://github.com/ostreedev/ostree/issues/326) that
@@ -442,14 +439,13 @@ builder_cache_commit (BuilderCache *self,
   if (!ostree_repo_prepare_transaction (self->repo, NULL, NULL, error))
     return FALSE;
 
-  if (builder_context_get_rofiles_active (self->context) &&
-      !ostree_repo_scan_hardlinks (self->repo, NULL, error))
-    return FALSE;
-
   mtree = ostree_mutable_tree_new ();
 
   modifier = ostree_repo_commit_modifier_new (OSTREE_REPO_COMMIT_MODIFIER_FLAGS_SKIP_XATTRS,
                                               NULL, NULL, NULL);
+  if (self->devino_to_csum_cache)
+    ostree_repo_commit_modifier_set_devino_cache (modifier, self->devino_to_csum_cache);
+
   if (!ostree_repo_write_directory_to_mtree (self->repo, self->app_dir,
                                              mtree, modifier, NULL, error))
     goto out;
