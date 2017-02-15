@@ -1581,6 +1581,8 @@ builder_module_build (BuilderModule  *self,
         }
     }
 
+  g_print ("fixing python\n");
+
   if (!self->no_python_timestamp_fix)
     {
       if (!fixup_python_timestamp (AT_FDCWD,
@@ -1590,11 +1592,21 @@ builder_module_build (BuilderModule  *self,
         return FALSE;
     }
 
-  if (!builder_module_handle_debuginfo (self, app_dir, cache, context, error))
-    return FALSE;
+  g_print ("handling debuginfo\n");
+  {
+    GTimer *timer =  g_timer_new ();
+    g_timer_start (timer);
+
+    if (!builder_module_handle_debuginfo (self, app_dir, cache, context, error))
+      return FALSE;
+    g_timer_stop (timer);
+    g_print ("Took %.1f sec\n", g_timer_elapsed (timer, NULL));
+  }
+
 
   /* Clean up build dir */
 
+  g_print ("clean up build dir\n");
   if (!builder_context_get_keep_build_dirs (context))
     {
       if (!g_file_delete (build_link, NULL, error))

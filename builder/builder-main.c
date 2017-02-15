@@ -276,7 +276,10 @@ main (int    argc,
     }
 
   if (opt_verbose)
-    g_log_set_handler (G_LOG_DOMAIN, G_LOG_LEVEL_DEBUG, message_handler, NULL);
+    {
+      g_log_set_handler (G_LOG_DOMAIN, G_LOG_LEVEL_DEBUG, message_handler, NULL);
+      g_log_set_handler ("OSTree", G_LOG_LEVEL_DEBUG, message_handler, NULL);
+    }
 
   argnr = 1;
 

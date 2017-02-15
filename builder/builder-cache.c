@@ -414,21 +414,61 @@ checkout:
   return FALSE;
 }
 
+static OstreeRepoCommitFilterResult
+filter_only_non_hardlinked (OstreeRepo    *repo,
+                            const char    *path,
+                            GFileInfo     *file_info,
+                            gpointer       user_data)
+{
+  GFileType file_type = g_file_info_get_file_type (file_info);
+  g_autofree char *full_path = NULL;
+  struct stat buf;
+
+  if (file_type == G_FILE_TYPE_DIRECTORY)
+    return OSTREE_REPO_COMMIT_FILTER_ALLOW;
+
+  if (file_type != G_FILE_TYPE_REGULAR)
+    return OSTREE_REPO_COMMIT_FILTER_SKIP;
+
+  full_path = g_build_filename ((char *)user_data, path, NULL);
+
+  if (stat (full_path, &buf) == 0 && buf.st_nlink == 1)
+    {
+      g_print ("allowing non-hardlink %s\n", path);
+      return OSTREE_REPO_COMMIT_FILTER_ALLOW;
+    }
+
+  return OSTREE_REPO_COMMIT_FILTER_SKIP;
+}
+
 gboolean
 builder_cache_commit (BuilderCache *self,
                       const char   *body,
                       GError      **error)
 {
   g_autofree char *current = NULL;
-  OstreeRepoCommitModifier *modifier = NULL;
-
+  g_autoptr(OstreeRepoCommitModifier) modifier = NULL;
+  g_autoptr(OstreeRepoCommitModifier) modifier2 = NULL;
   g_autoptr(OstreeMutableTree) mtree = NULL;
+  g_autoptr(OstreeMutableTree) mtree2 = NULL;
   g_autoptr(GFile) root = NULL;
+  g_autoptr(GFile) root2 = NULL;
   g_autofree char *commit_checksum = NULL;
+  g_autofree char *commit_checksum2 = NULL;
   gboolean res = FALSE;
   g_autofree char *ref = NULL;
 
+  GTimer *timer =  g_timer_new ();
+  g_timer_start (timer);
+
   g_print ("Committing stage %s to cache\n", self->stage);
+
+  {
+    g_autofree char *p = g_build_filename (flatpak_file_get_path_cached (self->app_dir), "usr/bin/bash", NULL);
+    struct stat buf;
+    if (stat (p, &buf) == 0)
+      g_print ("usr/bin/bash: inode %ld, nlink: %ld\n", buf.st_ino, buf.st_nlink);
+  }
 
   /* We set all mtimes to 0 during a commit, to simulate what would happen when
      running via flatpak deploy (and also if we checked out from the cache). */
@@ -460,16 +500,57 @@ builder_cache_commit (BuilderCache *self,
                                  &commit_checksum, NULL, error))
     goto out;
 
+  g_print ("cache commit checksum: %s\n", commit_checksum);
+
   ref = builder_cache_get_current_ref (self);
   ostree_repo_transaction_set_ref (self->repo, NULL, ref, commit_checksum);
+
+  /* Commit just new files */
+
+  mtree2 = ostree_mutable_tree_new ();
+  modifier2 = ostree_repo_commit_modifier_new (OSTREE_REPO_COMMIT_MODIFIER_FLAGS_SKIP_XATTRS,
+                                               filter_only_non_hardlinked, (char *)flatpak_file_get_path_cached (self->app_dir), NULL);
+  if (self->devino_to_csum_cache)
+    ostree_repo_commit_modifier_set_devino_cache (modifier2, self->devino_to_csum_cache);
+
+  if (!ostree_repo_write_directory_to_mtree (self->repo, self->app_dir,
+                                             mtree2, modifier2, NULL, error))
+    goto out;
+
+  if (!ostree_repo_write_mtree (self->repo, mtree2, &root2, NULL, error))
+    goto out;
+
+  if (!ostree_repo_write_commit (self->repo, NULL, current, body, NULL,
+                                 OSTREE_REPO_FILE (root2),
+                                 &commit_checksum2, NULL, error))
+    goto out;
+
+  g_print ("cache commit checksum2: %s\n", commit_checksum2);
 
   if (!ostree_repo_commit_transaction (self->repo, NULL, NULL, error))
     goto out;
 
+  g_timer_stop (timer);
+  g_print ("Took %.1f sec\n", g_timer_elapsed (timer, NULL));
+
+  g_timer_reset (timer);
+  g_timer_start (timer);
+
   /* Check out the just commited cache so we hardlinks to the cache */
+  g_print ("Checking out cache\n");
   if (builder_context_get_use_rofiles (self->context) &&
-      !builder_cache_checkout (self, commit_checksum, FALSE, error))
+      !builder_cache_checkout (self, commit_checksum2, FALSE, error))
     goto out;
+
+  {
+    g_autofree char *p = g_build_filename (flatpak_file_get_path_cached (self->app_dir), "usr/bin/bash", NULL);
+    struct stat buf;
+    if (stat (p, &buf) == 0)
+      g_print ("usr/bin/bash: inode %ld, nlink: %ld\n", buf.st_ino, buf.st_nlink);
+  }
+
+  g_timer_stop (timer);
+  g_print ("Took %.1f sec\n", g_timer_elapsed (timer, NULL));
 
   g_free (self->last_parent);
   self->last_parent = g_steal_pointer (&commit_checksum);
@@ -482,8 +563,6 @@ out:
       if (!ostree_repo_abort_transaction (self->repo, NULL, NULL))
         g_warning ("failed to abort transaction");
     }
-  if (modifier)
-    ostree_repo_commit_modifier_unref (modifier);
 
   return res;
 }

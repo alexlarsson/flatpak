@@ -1460,10 +1460,12 @@ builder_manifest_build (BuilderManifest *self,
           g_print ("Cache hit for %s, skipping build\n", name);
         }
 
+      g_print ("Getting changes\n");
       changes = builder_cache_get_changes (cache, error);
       if (changes == NULL)
         return FALSE;
 
+      g_print ("Setting changes\n");
       builder_module_set_changes (m, changes);
 
       builder_module_update (m, context, error);
