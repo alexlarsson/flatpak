@@ -3528,6 +3528,7 @@ flatpak_repo_generate_appstream (OstreeRepo   *repo,
       g_autoptr(GFile) root = NULL;
       g_autoptr(OstreeMutableTree) mtree = NULL;
       g_autofree char *commit_checksum = NULL;
+      g_autofree char *parent_commit_checksum = NULL;
       OstreeRepoTransactionStats stats;
       g_autoptr(OstreeRepoCommitModifier) modifier = NULL;
       g_autofree char *parent = NULL;
@@ -3608,7 +3609,7 @@ flatpak_repo_generate_appstream (OstreeRepo   *repo,
         {
           g_autoptr(GFile) parent_root;
 
-          if (!ostree_repo_read_commit (repo, parent, &parent_root, NULL, cancellable, error))
+          if (!ostree_repo_read_commit (repo, parent, &parent_root, &parent_commit_checksum, cancellable, error))
             goto out;
 
           if (g_file_equal (root, parent_root))
@@ -3633,33 +3634,44 @@ flatpak_repo_generate_appstream (OstreeRepo   *repo,
                                              &commit_checksum, cancellable, error))
                 goto out;
             }
-
-          if (gpg_key_ids)
-            {
-              int i;
-
-              for (i = 0; gpg_key_ids[i] != NULL; i++)
-                {
-                  const char *keyid = gpg_key_ids[i];
-
-                  if (!ostree_repo_sign_commit (repo,
-                                                commit_checksum,
-                                                keyid,
-                                                gpg_homedir,
-                                                cancellable,
-                                                error))
-                    goto out;
-                }
-            }
-
-          ostree_repo_transaction_set_ref (repo, NULL, branch, commit_checksum);
-
-          if (!ostree_repo_commit_transaction (repo, &stats, cancellable, error))
-            goto out;
         }
       else
         {
           ostree_repo_abort_transaction (repo, cancellable, NULL);
+          commit_checksum = g_strdup (parent_commit_checksum);
+        }
+
+      /* Always sign commit, it may not have changed but we have a new gpg key */
+      if (gpg_key_ids)
+        {
+          int i;
+
+          for (i = 0; gpg_key_ids[i] != NULL; i++)
+            {
+              const char *keyid = gpg_key_ids[i];
+              g_autoptr(GError) my_error = NULL;
+
+              if (!ostree_repo_sign_commit (repo,
+                                            commit_checksum,
+                                            keyid,
+                                            gpg_homedir,
+                                            cancellable,
+                                            &my_error) &&
+                  /* Ignore if the signature already exists */
+                  !g_error_matches (my_error, G_IO_ERROR, G_IO_ERROR_EXISTS))
+                {
+                  g_propagate_error (error, g_steal_pointer (&my_error));
+                  goto out;
+                }
+            }
+        }
+
+      if (!skip_commit)
+        {
+          ostree_repo_transaction_set_ref (repo, NULL, branch, commit_checksum);
+
+          if (!ostree_repo_commit_transaction (repo, &stats, cancellable, error))
+            goto out;
         }
     }
 
