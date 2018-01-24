@@ -1,0 +1,11 @@
+installation: !mux
+  user:
+    installation: user
+  system:
+    installation: system
+
+apps:
+  - org.gnome.gedit
+  - Gedit
+  - com.spotify.Client
+  - Spotify
