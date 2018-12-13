@@ -45,9 +45,6 @@ struct _FlatpakCliTransaction
   int                table_width;
   int                table_height;
 
-  gboolean           progress_initialized;
-  int                progress_last_width;
-
   int                n_ops;
   int                op;
   int                op_progress;
@@ -61,6 +58,7 @@ struct _FlatpakCliTransaction
   FlatpakTablePrinter *printer;
   int                  progress_row;
   char                *progress_msg;
+  int                  speed_len;
 };
 
 struct _FlatpakCliTransactionClass
@@ -165,9 +163,6 @@ op_type_to_string (FlatpakTransactionOperationType operation_type)
     }
 }
 
-#define BAR_LENGTH 20
-#define BAR_CHARS " -=#"
-
 static void
 redraw (FlatpakCliTransaction *self)
 {
@@ -220,6 +215,24 @@ spin_op_progress (FlatpakCliTransaction *self,
   set_op_progress (self, op, p[self->op_progress++ % strlen (p)]);
 }
 
+#define BAR_CHARS " -=#"
+
+static char *
+format_duration (guint64 duration)
+{
+  int h, m, s;
+
+  m = duration / 60;
+  s = duration % 60;
+  h = m / 60;
+  m = m % 60;
+
+  if (h > 0)
+    return g_strdup_printf ("%02d:%02d:%02d", h, m, s);
+  else
+    return g_strdup_printf ("%02d:%02d", m, s);
+}
+
 static void
 progress_changed_cb (FlatpakTransactionProgress *progress,
                      gpointer                    data)
@@ -231,68 +244,68 @@ progress_changed_cb (FlatpakTransactionProgress *progress,
   g_autoptr(GString) str = g_string_new ("");
   int i;
   int n_full, remainder, partial;
-  int width, padded_width;
-  g_autofree char *text = NULL;
+  g_autofree char *speed = NULL;
+  int bar_length;
 
   guint percent = flatpak_transaction_progress_get_progress (progress);
-  g_autofree char *status = flatpak_transaction_progress_get_status (progress);
+  guint64 start_time = flatpak_transaction_progress_get_start_time (progress);
+  guint64 elapsed_time = (g_get_monotonic_time () - start_time) / G_USEC_PER_SEC;
+  guint64 transferred = flatpak_transaction_progress_get_bytes_transferred (progress);
+  guint64 max = flatpak_transaction_operation_get_download_size (op);
+
+  if (elapsed_time > 0)
+    {
+      g_autofree char *formatted_bytes_sec = g_format_size (transferred / elapsed_time);
+      g_autofree char *remaining = NULL;
+      if (transferred > 0)
+        {
+          guint64 time = elapsed_time * ((max - transferred) / (double)transferred);
+          remaining = format_duration (time);
+        }
+      speed = g_strdup_printf ("%s/s%s%s", formatted_bytes_sec, remaining ? "  " : "", remaining);
+      cli->speed_len = MAX (cli->speed_len, strlen (speed) + 2);
+    }
 
   spin_op_progress (cli, op);
 
-  if (!cli->progress_initialized)
-    {
-      cli->progress_last_width = 0;
-      cli->progress_initialized = TRUE;
-    }
+  bar_length = cli->table_width - (strlen (cli->progress_msg) + 4 + 4 + cli->speed_len);
+
+  n_full = (bar_length * percent) / 100;
+  remainder = percent - (n_full * 100 / bar_length);
+  partial = MIN ((remainder * strlen (BAR_CHARS) * bar_length) / 100, strlen (BAR_CHARS) - 1);
 
   g_string_append (str, cli->progress_msg);
   g_string_append (str, " [");
 
-  n_full = (BAR_LENGTH * percent) / 100;
-  remainder = percent - (n_full * 100 / BAR_LENGTH);
-  partial = (remainder * strlen (BAR_CHARS) * BAR_LENGTH) / 100;
-
   for (i = 0; i < n_full; i++)
     g_string_append_c (str, BAR_CHARS[strlen (BAR_CHARS) - 1]);
 
-  if (i < BAR_LENGTH)
+  if (i < bar_length)
     {
       g_string_append_c (str, BAR_CHARS[partial]);
       i++;
     }
 
-  for (; i < BAR_LENGTH; i++)
+  for (; i < bar_length; i++)
     g_string_append (str, " ");
 
   g_string_append (str, "] ");
-  g_string_append_printf (str, "%d%%", percent);
+  g_string_append_printf (str, "%3d%%", percent);
 
-  if (g_str_has_suffix (status, ")"))
-    {
-      char *p = strrchr (status, '(');
-      g_autofree char *speed = g_strndup (p + 1, strlen (p) - 2);
-      g_string_append_printf (str, " %s", speed);
-    }
+  if (speed)
+    g_string_append_printf (str, "  %s", speed);
 
-  width = MIN (strlen (str->str), cli->cols);
-  padded_width = MAX (cli->progress_last_width, width);
-  cli->progress_last_width = width;
-  text = g_strdup_printf ("%-*.*s", padded_width, padded_width, str->str);
   if (flatpak_fancy_output ())
     {
-      flatpak_table_printer_set_cell (cli->printer, cli->progress_row, 0, text);
+      flatpak_table_printer_set_cell (cli->printer, cli->progress_row, 0, str->str);
       if (flatpak_transaction_operation_get_operation_type (op) != FLATPAK_TRANSACTION_OPERATION_UNINSTALL)
         {
-          guint64 max;
-          guint64 transferred;
           g_autofree char *formatted_max = NULL;
           g_autofree char *formatted = NULL;
           g_autofree char *text = NULL;
           int row;
 
-          max = flatpak_transaction_operation_get_download_size (op);
           formatted_max = g_format_size (max);
-          transferred = flatpak_transaction_progress_get_bytes_transferred (progress);
           if (transferred < 1024) // avoid "bytes"
             formatted = g_strdup ("0.0 kB");
           else
@@ -304,9 +317,7 @@ progress_changed_cb (FlatpakTransactionProgress *progress,
       redraw (cli);
     }
   else
-    {
-      g_print ("\r%s", text);
-    }
+    g_print ("\r%s", str->str);
 }
 
 static void
@@ -364,18 +375,11 @@ new_operation (FlatpakTransaction          *transaction,
       redraw (self);
     }
   else
-    {
-      int spaces = BAR_LENGTH + 10;
-
-      if (self->progress_msg)
-        spaces += (int)(strlen (self->progress_msg) - strlen (text));
-      g_print ("\r%s%*s", text, spaces, "");
-    }
+    g_print ("\r%-*s", self->table_width, text);
 
   g_free (self->progress_msg);
   self->progress_msg = g_steal_pointer (&text);
 
-  self->progress_initialized = FALSE;
   g_signal_connect (progress, "changed", G_CALLBACK (progress_changed_cb), self);
   flatpak_transaction_progress_set_update_frequency (progress, FLATPAK_CLI_UPDATE_FREQUENCY);
 }
@@ -410,7 +414,7 @@ operation_error (FlatpakTransaction            *transaction,
   g_autoptr(FlatpakRef) rref = flatpak_ref_parse (ref, NULL);
   g_autofree char *msg = NULL;
   gboolean non_fatal = (detail & FLATPAK_TRANSACTION_ERROR_DETAILS_NON_FATAL) != 0;
-  const char *prefix;
+  g_autofree char *text = NULL;
 
   if (g_error_matches (error, FLATPAK_ERROR, FLATPAK_ERROR_SKIPPED))
     {
@@ -425,13 +429,7 @@ operation_error (FlatpakTransaction            *transaction,
           redraw (self);
         }
       else
-        {
-          int spaces = BAR_LENGTH + 10;
-
-          if (self->progress_msg)
-            spaces += (int)(strlen (self->progress_msg) - strlen (msg));
-          g_print ("\r%s%*s\n", msg, spaces, ""); /* override progress, and go to next line */
-        }
+        g_print ("\r%-*s\n", self->table_width, msg); /* override progress, and go to next line */
 
       return TRUE;
     }
@@ -455,11 +453,10 @@ operation_error (FlatpakTransaction            *transaction,
                                  _("Failed to %s %s: "),
                                  op_type_to_string (op_type), flatpak_ref_get_name (rref));
 
-  prefix = non_fatal ? _("Warning:") : _("Error:");
+  text = g_strconcat (non_fatal ? _("Warning:") : _("Error:"), " ", msg, NULL);
 
   if (flatpak_fancy_output ())
     {
-      g_autofree char *text = g_strconcat (prefix, " ", msg, NULL);
       flatpak_table_printer_set_cell (self->printer, self->progress_row, 0, text);
       self->progress_row++;
       flatpak_table_printer_add_span (self->printer, "");
@@ -467,13 +464,7 @@ operation_error (FlatpakTransaction            *transaction,
       redraw (self);
     }
   else
-    {
-      int spaces = BAR_LENGTH + 10;
-
-      if (self->progress_msg)
-        spaces += (int)(strlen (self->progress_msg) - (strlen (prefix) + 1 + strlen (msg)));
-      g_print ("\r%s %s%*s\n", prefix, msg, spaces, "");
-    }
+    g_print ("\r%-*s\n", self->table_width, text);
 
   if (!non_fatal && self->stop_on_first_error)
     return FALSE;
@@ -507,13 +498,7 @@ end_of_lifed (FlatpakTransaction *transaction,
       redraw (self);
     }
   else
-    {
-      int spaces = BAR_LENGTH + 10;
-
-      if (self->progress_msg)
-        spaces += (int)(strlen (self->progress_msg) - strlen (msg));
-      g_print ("\r%s%*s\n", msg, spaces, "");
-    }
+    g_print ("\r%-*s\n", self->table_width, msg);
 }
 
 
@@ -995,13 +980,7 @@ flatpak_cli_transaction_run (FlatpakTransaction *transaction,
           redraw (self);
         }
       else
-        {
-          int spaces = BAR_LENGTH + 10;
-
-          if (self->progress_msg)
-            spaces += (int)(strlen (self->progress_msg) - strlen (text));
-          g_print ("\r%s%*s", text, spaces, "");
-        }
+        g_print ("\r%-*s", self->table_width, text);
 
       g_print ("\n");
     }
