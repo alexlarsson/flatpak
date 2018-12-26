@@ -209,6 +209,43 @@
             </varlistentry>
 
             <varlistentry>
+                <term><option>--nofilesystem=FILESYSTEM</option></term>
+
+                <listitem><para>
+                    Remove access to the specified subset of the filesystem from
+                    the application. This overrides to the Context section from the
+                    application metadata.
+                    FILESYSTEM can be one of: home, host, xdg-desktop, xdg-documents, xdg-download
+                    xdg-music, xdg-pictures, xdg-public-share, xdg-templates, xdg-videos,
+                    an absolute path, or a homedir-relative path like ~/dir.
+                    This option can be used multiple times.
+                </para></listitem>
+            </varlistentry>
+
+            <varlistentry>
+                <term><option>--add-policy=SUBSYSTEM.KEY=VALUE</option></term>
+
+                <listitem><para>
+                    Add generic policy option. For example, "--add-policy=subsystem.key=v1 --add-policy=subsystem.key=v2" would map to this metadata:
+<programlisting>
+[Policy subsystem]
+key=v1;v2;
+</programlisting>
+                </para></listitem>
+                <listitem><para>
+                    This option can be used multiple times.
+                </para></listitem>
+            </varlistentry>
+
+            <varlistentry>
+                <term><option>--remove-policy=SUBSYSTEM.KEY=VALUE</option></term>
+
+                <listitem><para>
+                    Remove generic policy option. This option can be used multiple times.
+                </para></listitem>
+            </varlistentry>
+
+            <varlistentry>
                 <term><option>--env=VAR=VALUE</option></term>
 
                 <listitem><para>
@@ -283,6 +320,23 @@
                 <listitem><para>
                   Change the runtime or sdk used by the app to the specified partial ref. Unspecified parts
                   of the ref are taken from the old values or defaults.
+                </para></listitem>
+            </varlistentry>
+
+            <varlistentry>
+                <term><option>--metadata=GROUP=KEY[=VALUE]</option></term>
+
+                <listitem><para>
+                  Set a generic key in the metadata file. If value is left out it will
+                  be set to "true".
+                </para></listitem>
+            </varlistentry>
+
+            <varlistentry>
+                <term><option>--extension=NAME=VARIABLE[=VALUE]</option></term>
+
+                <listitem><para>
+                  Add extension point info.
                 </para></listitem>
             </varlistentry>
 

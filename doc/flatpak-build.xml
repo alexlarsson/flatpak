@@ -79,19 +79,20 @@
             </varlistentry>
 
             <varlistentry>
-                <term><option>--version</option></term>
-
-                <listitem><para>
-                    Print version information and exit.
-                </para></listitem>
-            </varlistentry>
-
-            <varlistentry>
                 <term><option>-r</option></term>
                 <term><option>--runtime</option></term>
 
                 <listitem><para>
                     Use the non-devel runtime that is specified in the application metadata instead of the devel runtime.
+                </para></listitem>
+            </varlistentry>
+
+            <varlistentry>
+                <term><option>-p</option></term>
+                <term><option>--die-with-parent</option></term>
+
+                <listitem><para>
+                    Kill the build process and all children when the launching process dies.
                 </para></listitem>
             </varlistentry>
 
@@ -178,6 +179,38 @@
             </varlistentry>
 
             <varlistentry>
+                <term><option>--allow=FEATURE</option></term>
+
+                <listitem><para>
+                    Allow access to a specific feature. This updates
+                    the [Context] group in the metadata.
+                    FEATURE must be one of: devel, multiarch.
+                    This option can be used multiple times.
+                 </para><para>
+                    The <code>devel</code> feature allows the application to
+                    access certain syscalls such as <code>ptrace()</code>, and
+                <code>perf_event_open()</code>.
+                </para><para>
+                    The <code>multiarch</code> feature allows the application to
+                    execute programs compiled for an ABI other than the one supported
+                    natively by the system. For example, for the <code>x86_64</code>
+                    architecture, 32-bit <code>x86</code> binaries will be allowed as
+                    well.
+                </para></listitem>
+            </varlistentry>
+
+            <varlistentry>
+                <term><option>--disallow=FEATURE</option></term>
+
+                <listitem><para>
+                    Disallow access to a specific feature. This updates
+                    the [Context] group in the metadata.
+                    FEATURE must be one of: devel, multiarch.
+                    This option can be used multiple times.
+                </para></listitem>
+            </varlistentry>
+
+            <varlistentry>
                 <term><option>--filesystem=FILESYSTEM[:ro|:create]</option></term>
 
                 <listitem><para>
@@ -204,6 +237,38 @@
                     xdg-music, xdg-pictures, xdg-public-share, xdg-templates, xdg-videos,
                     an absolute path, or a homedir-relative path like ~/dir.
                     This option can be used multiple times.
+                </para></listitem>
+            </varlistentry>
+
+            <varlistentry>
+                <term><option>--with-appdir</option></term>
+
+                <listitem><para>
+                  Expose and configure access to the per-app storage directory in $HOME/.var/app. This is
+                  not normally useful when building, but helps when testing built apps.
+                </para></listitem>
+            </varlistentry>
+
+            <varlistentry>
+                <term><option>--add-policy=SUBSYSTEM.KEY=VALUE</option></term>
+
+                <listitem><para>
+                    Add generic policy option. For example, "--add-policy=subsystem.key=v1 --add-policy=subsystem.key=v2" would map to this metadata:
+<programlisting>
+[Policy subsystem]
+key=v1;v2;
+</programlisting>
+                </para></listitem>
+                <listitem><para>
+                    This option can be used multiple times.
+                </para></listitem>
+            </varlistentry>
+
+            <varlistentry>
+                <term><option>--remove-policy=SUBSYSTEM.KEY=VALUE</option></term>
+
+                <listitem><para>
+                    Remove generic policy option. This option can be used multiple times.
                 </para></listitem>
             </varlistentry>
 

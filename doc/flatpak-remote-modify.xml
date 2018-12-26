@@ -86,7 +86,7 @@
 
                 <listitem><para>
                     Modify a system-wide installation specified by <arg choice="plain">NAME</arg>
-                    among those defined in <filename>/etc/flatpak/installations.d</filename>.
+                    among those defined in <filename>/etc/flatpak/installations.d/</filename>.
                     Using <arg choice="plain">--installation=default</arg> is equivalent to using
                     <arg choice="plain">--system</arg>.
                 </para></listitem>
@@ -184,6 +184,27 @@
 
                 <listitem><para>
                     A default branch to for the remote, mainly for use in a UI.
+                </para></listitem>
+            </varlistentry>
+
+            <!-- FIXME: Uncomment this when enable-p2p is enabled unconditionally.
+            <varlistentry>
+                <term><option>-FIXME-collection-id=COLLECTION-ID</option></term>
+
+                <listitem><para>
+                    The globally unique identifier of the remote repository, to
+                    allow mirrors to be grouped. This must only be set to the
+                    collection ID provided by the remote, and must not be set if the
+                    remote does not provide an collection ID.
+                </para></listitem>
+            </varlistentry>
+            -->
+
+            <varlistentry>
+                <term><option>--url=URL</option></term>
+
+                <listitem><para>
+                    Set a new URL.
                 </para></listitem>
             </varlistentry>
 

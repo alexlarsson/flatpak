@@ -53,6 +53,7 @@ demarshal (JsonNode *parent_node,
            FlatpakJsonPropType type,
            gpointer type_data,
            gpointer type_data2,
+           FlatpakJsonPropFlags flags,
            GError **error)
 {
   JsonObject *parent_object;
@@ -62,6 +63,13 @@ demarshal (JsonNode *parent_node,
     {
       parent_object = json_node_get_object (parent_node);
       node = json_object_get_member (parent_object, name);
+
+      if (node == NULL && (flags & FLATPAK_JSON_PROP_FLAGS_MANDATORY) != 0)
+        {
+          g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                       "No value for mandatory property %s", name);
+          return FALSE;
+        }
     }
   else
     node = parent_node;
@@ -145,12 +153,32 @@ demarshal (JsonNode *parent_node,
         FlatpakJsonProp *struct_props = type_data;
         int i;
 
+        if ((struct_props->flags & FLATPAK_JSON_PROP_FLAGS_STRICT) != 0)
+          {
+            JsonObject *object = json_node_get_object (node);
+            g_autoptr(GList) members = json_object_get_members (object);
+            GList *l;
+
+            /* Verify that all members are known properties if strict flag is set */
+            for (l = members; l != NULL; l = l->next)
+              {
+                const char *name = l->data;
+                for (i = 0; struct_props[i].name != NULL; i++)
+                  {
+                    if (strcmp (struct_props[i].name, name) == 0)
+                      break;
+                  }
+                if (struct_props[i].name == NULL)
+                  return flatpak_fail (error, "Unknown property named %s", name);
+              }
+          }
+
         for (i = 0; struct_props[i].name != NULL; i++)
           {
             if (!demarshal (node, struct_props[i].name,
                             G_STRUCT_MEMBER_P (dest, struct_props[i].offset),
                             struct_props[i].type, struct_props[i].type_data, struct_props[i].type_data2,
-                            error))
+                            struct_props[i].flags, error))
               return FALSE;
           }
       }
@@ -192,7 +220,7 @@ demarshal (JsonNode *parent_node,
                 if (!demarshal (val, struct_props[i].name,
                                 G_STRUCT_MEMBER_P (new_element, struct_props[i].offset),
                                 struct_props[i].type, struct_props[i].type_data, struct_props[i].type_data2,
-                                error))
+                                struct_props[i].flags, error))
                   {
                     res = FALSE;
                     break;
@@ -314,7 +342,7 @@ flatpak_json_from_node (JsonNode *node, GType type, GError **error)
           if (!demarshal (node, props[i].name,
                           G_STRUCT_MEMBER_P (json, props[i].offset),
                           props[i].type, props[i].type_data, props[i].type_data2,
-                          error))
+                          props[i].flags, error))
             return NULL;
         }
       class = g_type_class_peek_parent (class);
@@ -348,7 +376,8 @@ marshal (JsonObject *parent,
          const char *name,
          gpointer src,
          FlatpakJsonPropType type,
-         gpointer type_data)
+         gpointer type_data,
+         FlatpakJsonPropFlags flags)
 {
   JsonNode *retval = NULL;
 
@@ -405,6 +434,7 @@ marshal (JsonObject *parent,
         FlatpakJsonProp *struct_props = type_data;
         JsonObject *obj;
         int i;
+        gboolean empty = TRUE;
 
         if (type == FLATPAK_JSON_PROP_TYPE_PARENT)
           obj = parent;
@@ -415,15 +445,17 @@ marshal (JsonObject *parent,
           {
             JsonNode *val = marshal (obj, struct_props[i].name,
                                      G_STRUCT_MEMBER_P (src, struct_props[i].offset),
-                                     struct_props[i].type, struct_props[i].type_data);
+                                     struct_props[i].type, struct_props[i].type_data, struct_props[i].flags);
 
             if (val == NULL)
               continue;
 
+            empty = FALSE;
             json_object_set_member (obj, struct_props[i].name, val);
           }
 
-        if (type != FLATPAK_JSON_PROP_TYPE_PARENT)
+        if (type != FLATPAK_JSON_PROP_TYPE_PARENT &&
+            (!empty || (flags & FLATPAK_JSON_PROP_FLAGS_OPTIONAL) == 0))
           {
             retval = json_node_new (JSON_NODE_OBJECT);
             json_node_take_object (retval, obj);
@@ -450,7 +482,7 @@ marshal (JsonObject *parent,
                   {
                     JsonNode *val = marshal (obj, struct_props[i].name,
                                              G_STRUCT_MEMBER_P (structv[j], struct_props[i].offset),
-                                             struct_props[i].type, struct_props[i].type_data);
+                                             struct_props[i].type, struct_props[i].type_data, struct_props[i].flags);
 
                     if (val == NULL)
                       continue;
@@ -554,7 +586,7 @@ marshal_props_for_class (FlatpakJson *self,
     {
       JsonNode *val = marshal (obj, props[i].name,
                                G_STRUCT_MEMBER_P (self, props[i].offset),
-                               props[i].type, props[i].type_data);
+                               props[i].type, props[i].type_data, props[i].flags);
 
       if (val == NULL)
         continue;

@@ -31,6 +31,7 @@
 
 #include "flatpak-builtins.h"
 #include "flatpak-utils.h"
+#include "flatpak-table-printer.h"
 
 static gboolean opt_show_details;
 static gboolean opt_user;
@@ -100,6 +101,16 @@ flatpak_builtin_list_remotes (int argc, char **argv, GCancellable *cancellable, 
 
   printer = flatpak_table_printer_new ();
 
+  j = 0;
+  flatpak_table_printer_set_column_title (printer, j++, _("Name"));
+  if (opt_show_details)
+    {
+      flatpak_table_printer_set_column_title (printer, j++, _("Title"));
+      flatpak_table_printer_set_column_title (printer, j++, _("URL"));
+      flatpak_table_printer_set_column_title (printer, j++, _("Priority"));
+    }
+  flatpak_table_printer_set_column_title (printer, j++, _("Options"));
+
   for (j = 0; j < dirs->len; j++)
     {
       FlatpakDir *dir = g_ptr_array_index (dirs, j);
@@ -133,9 +144,10 @@ flatpak_builtin_list_remotes (int argc, char **argv, GCancellable *cancellable, 
               else
                 flatpak_table_printer_add_column (printer, "-");
 
-              ostree_repo_remote_get_url (flatpak_dir_get_repo (dir), remote_name, &remote_url, NULL);
-
-              flatpak_table_printer_add_column (printer, remote_url);
+              if (ostree_repo_remote_get_url (flatpak_dir_get_repo (dir), remote_name, &remote_url, NULL))
+                flatpak_table_printer_add_column (printer, remote_url);
+              else
+                flatpak_table_printer_add_column (printer, "-");
 
               prio = flatpak_dir_get_remote_prio (dir, remote_name);
               prio_as_string = g_strdup_printf ("%d", prio);
@@ -154,6 +166,9 @@ flatpak_builtin_list_remotes (int argc, char **argv, GCancellable *cancellable, 
 
           if (disabled)
             flatpak_table_printer_append_with_comma (printer, "disabled");
+
+          if (flatpak_dir_get_remote_oci (dir, remote_name))
+            flatpak_table_printer_append_with_comma (printer, "oci");
 
           if (flatpak_dir_get_remote_noenumerate (dir, remote_name))
             flatpak_table_printer_append_with_comma (printer, "no-enumerate");

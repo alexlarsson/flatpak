@@ -22,6 +22,11 @@
 
 #include <string.h>
 
+#ifdef FLATPAK_ENABLE_P2P
+#include <ostree.h>
+#include <ostree-repo-finder-avahi.h>
+#endif  /* FLATPAK_ENABLE_P2P */
+
 #include "flatpak-utils.h"
 #include "flatpak-installation.h"
 #include "flatpak-installed-ref-private.h"
@@ -68,6 +73,11 @@ G_DEFINE_TYPE_WITH_PRIVATE (FlatpakInstallation, flatpak_installation, G_TYPE_OB
 enum {
   PROP_0,
 };
+
+static void
+no_progress_cb (OstreeAsyncProgress *progress, gpointer user_data)
+{
+}
 
 static void
 flatpak_installation_finalize (GObject *object)
@@ -182,7 +192,7 @@ flatpak_get_supported_arches (void)
  * Lists the system installations according to the current configuration and current
  * availability (e.g. doesn't return a configured installation if not reachable).
  *
- * Returns: (transfer full) (element-type FlatpakInstallation): an GPtrArray of
+ * Returns: (transfer container) (element-type FlatpakInstallation): an GPtrArray of
  *   #FlatpakInstallation instances
  *
  * Since: 0.8
@@ -200,7 +210,7 @@ flatpak_get_system_installations (GCancellable *cancellable,
   if (system_dirs == NULL)
     goto out;
 
-  installs = g_ptr_array_new ();
+  installs = g_ptr_array_new_with_free_func ((GDestroyNotify) g_object_unref);
   for (i = 0; i < system_dirs->len; i++)
     {
       g_autoptr(GError) local_error = NULL;
@@ -559,6 +569,7 @@ get_ref (FlatpakDir          *dir,
   g_autoptr(GFile) deploy_subdir = NULL;
   g_autofree char *deploy_path = NULL;
   g_autofree char *latest_commit = NULL;
+  g_autofree char *deploy_subdirname = NULL;
   g_autoptr(GVariant) deploy_data = NULL;
   g_autofree const char **subpaths = NULL;
   gboolean is_current = FALSE;
@@ -576,7 +587,8 @@ get_ref (FlatpakDir          *dir,
   installed_size = flatpak_deploy_data_get_installed_size (deploy_data);
 
   deploy_dir = flatpak_dir_get_deploy_dir (dir, full_ref);
-  deploy_subdir = g_file_get_child (deploy_dir, commit);
+  deploy_subdirname = flatpak_dir_get_deploy_subdir (dir, commit, subpaths);
+  deploy_subdir = g_file_get_child (deploy_dir, deploy_subdirname);
   deploy_path = g_file_get_path (deploy_subdir);
 
   if (strcmp (parts[0], "app") == 0)
@@ -844,7 +856,7 @@ flatpak_installation_list_installed_refs_for_update (FlatpakInstallation *self,
         }
       else
         {
-          g_debug ("Update: Failed to read remote %s: %s\n",
+          g_debug ("Update: Failed to read remote %s: %s",
                    flatpak_remote_get_name (remote),
                    local_error->message);
         }
@@ -873,6 +885,93 @@ flatpak_installation_list_installed_refs_for_update (FlatpakInstallation *self,
   return g_steal_pointer (&updates);
 }
 
+#ifdef FLATPAK_ENABLE_P2P
+static void
+async_result_cb (GObject      *obj,
+                 GAsyncResult *result,
+                 gpointer      user_data)
+{
+  GAsyncResult **result_out = user_data;
+  *result_out = g_object_ref (result);
+}
+#endif  /* FLATPAK_ENABLE_P2P */
+
+/* Find all USB and LAN repositories which share the same collection ID as
+ * @remote_name, and add a #FlatpakRemote to @remotes for each of them. The caller
+ * must initialise @remotes. Returns %TRUE without modifying @remotes if the
+ * given remote doesn’t have a collection ID configured.
+ *
+ * FIXME: If this were async, the parallelisation could be handled in the caller. */
+static gboolean
+list_remotes_for_configured_remote (FlatpakInstallation  *self,
+                                    const gchar          *remote_name,
+                                    FlatpakDir           *dir,
+                                    GPtrArray            *remotes  /* (element-type FlatpakRemote) */,
+                                    GCancellable         *cancellable,
+                                    GError              **error)
+{
+#ifdef FLATPAK_ENABLE_P2P
+  g_autofree gchar *collection_id = NULL;
+  OstreeCollectionRef ref;
+  const OstreeCollectionRef *refs[2] = { NULL, };
+  g_autofree gchar *appstream_ref = NULL;
+  g_autoptr(GMainContext) context = NULL;
+  g_auto(OstreeRepoFinderResultv) results = NULL;
+  g_autoptr(GAsyncResult) result = NULL;
+  g_autoptr(OstreeRepoFinder) finder_mount = NULL, finder_avahi = NULL;
+  OstreeRepoFinder *finders[3] = { NULL, };
+  gsize i;
+
+  /* Find the collection ID for @remote_name, or bail if there is none. */
+  if (!ostree_repo_get_remote_option (flatpak_dir_get_repo (dir),
+                                      remote_name, "collection-id",
+                                      NULL, &collection_id, error))
+    return FALSE;
+  if (collection_id == NULL || *collection_id == '\0')
+    return TRUE;
+
+  context = g_main_context_new ();
+  g_main_context_push_thread_default (context);
+
+  appstream_ref = g_strdup_printf ("appstream/%s", flatpak_get_arch ());
+  ref.collection_id = collection_id;
+  ref.ref_name = appstream_ref;
+  refs[0] = &ref;
+
+  finder_mount = OSTREE_REPO_FINDER (ostree_repo_finder_mount_new (NULL));
+  finder_avahi = OSTREE_REPO_FINDER (ostree_repo_finder_avahi_new (context));
+  finders[0] = finder_mount;
+  finders[1] = finder_avahi;
+
+  ostree_repo_finder_avahi_start (OSTREE_REPO_FINDER_AVAHI (finder_avahi), NULL);  /* ignore failure */
+  ostree_repo_find_remotes_async (flatpak_dir_get_repo (dir),
+                                  (const OstreeCollectionRef * const *) refs,
+                                  NULL,  /* no options */
+                                  finders,
+                                  NULL,  /* no progress */
+                                  cancellable,
+                                  async_result_cb,
+                                  &result);
+
+  while (result == NULL)
+    g_main_context_iteration (context, TRUE);
+
+  results = ostree_repo_find_remotes_finish (flatpak_dir_get_repo (dir), result, error);
+  ostree_repo_finder_avahi_stop (OSTREE_REPO_FINDER_AVAHI (finder_avahi));
+
+  g_main_context_pop_thread_default (context);
+
+  for (i = 0; results != NULL && results[i] != NULL; i++)
+    {
+      g_ptr_array_add (remotes,
+                       flatpak_remote_new_from_ostree (results[i]->remote,
+                                                       results[i]->finder,
+                                                       dir));
+    }
+#endif  /* FLATPAK_ENABLE_P2P */
+
+  return TRUE;
+}
 
 /**
  * flatpak_installation_list_remotes:
@@ -895,7 +994,7 @@ flatpak_installation_list_remotes (FlatpakInstallation *self,
   g_autoptr(FlatpakDir) dir_clone = NULL;
   g_auto(GStrv) remote_names = NULL;
   g_autoptr(GPtrArray) remotes = g_ptr_array_new_with_free_func (g_object_unref);
-  int i;
+  gsize i;
 
   remote_names = flatpak_dir_list_remotes (dir, cancellable, error);
   if (remote_names == NULL)
@@ -908,8 +1007,15 @@ flatpak_installation_list_remotes (FlatpakInstallation *self,
     return NULL;
 
   for (i = 0; remote_names[i] != NULL; i++)
-    g_ptr_array_add (remotes,
-                     flatpak_remote_new_with_dir (remote_names[i], dir_clone));
+    {
+      g_ptr_array_add (remotes,
+                       flatpak_remote_new_with_dir (remote_names[i], dir_clone));
+
+      /* Add the dynamic mirrors of this remote. */
+      if (!list_remotes_for_configured_remote (self, remote_names[i], dir_clone,
+                                               remotes, cancellable, error))
+        return NULL;
+    }
 
   return g_steal_pointer (&remotes);
 }
@@ -1097,147 +1203,17 @@ flatpak_installation_load_app_overrides (FlatpakInstallation *self,
   return metadata_contents;
 }
 
-static void
-progress_cb (OstreeAsyncProgress *progress, gpointer user_data)
-{
-  FlatpakProgressCallback progress_cb = g_object_get_data (G_OBJECT (progress), "callback");
-  guint last_progress = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (progress), "last_progress"));
-  GString *buf;
-  g_autofree char *status = NULL;
-  guint outstanding_fetches;
-  guint outstanding_metadata_fetches;
-  guint outstanding_writes;
-  guint n_scanned_metadata;
-  guint fetched_delta_parts;
-  guint total_delta_parts;
-  guint64 bytes_transferred;
-  guint64 total_delta_part_size;
-  guint outstanding_extra_data;
-  guint64 total_extra_data_bytes;
-  guint64 transferred_extra_data_bytes;
-  guint fetched;
-  guint metadata_fetched;
-  guint requested;
-  guint64 current_time;
-  guint new_progress = 0;
-  gboolean estimating = FALSE;
-
-  buf = g_string_new ("");
-
-  status = ostree_async_progress_get_status (progress);
-  outstanding_fetches = ostree_async_progress_get_uint (progress, "outstanding-fetches");
-  outstanding_metadata_fetches = ostree_async_progress_get_uint (progress, "outstanding-metadata-fetches");
-  outstanding_writes = ostree_async_progress_get_uint (progress, "outstanding-writes");
-  n_scanned_metadata = ostree_async_progress_get_uint (progress, "scanned-metadata");
-  fetched_delta_parts = ostree_async_progress_get_uint (progress, "fetched-delta-parts");
-  total_delta_parts = ostree_async_progress_get_uint (progress, "total-delta-parts");
-  total_delta_part_size = ostree_async_progress_get_uint64 (progress, "total-delta-part-size");
-  bytes_transferred = ostree_async_progress_get_uint64 (progress, "bytes-transferred");
-  outstanding_extra_data = ostree_async_progress_get_uint (progress, "outstanding-extra-data");
-  total_extra_data_bytes = ostree_async_progress_get_uint64 (progress, "total-extra-data-bytes");
-  transferred_extra_data_bytes = ostree_async_progress_get_uint64 (progress, "transferred-extra-data-bytes");
-  fetched = ostree_async_progress_get_uint (progress, "fetched");
-  metadata_fetched = ostree_async_progress_get_uint (progress, "metadata-fetched");
-  requested = ostree_async_progress_get_uint (progress, "requested");
-  current_time = g_get_monotonic_time ();
-
-  if (status)
-    {
-      g_string_append (buf, status);
-    }
-  else if (outstanding_fetches)
-    {
-      guint64 elapsed_time =
-        (current_time - ostree_async_progress_get_uint64 (progress, "start-time")) / G_USEC_PER_SEC;
-      guint64 bytes_sec = (elapsed_time > 0) ? bytes_transferred / elapsed_time : 0;
-      g_autofree char *formatted_bytes_transferred =
-        g_format_size_full (bytes_transferred, 0);
-      g_autofree char *formatted_bytes_sec = NULL;
-
-      if (!bytes_sec) // Ignore first second
-        formatted_bytes_sec = g_strdup ("-");
-      else
-        formatted_bytes_sec = g_format_size (bytes_sec);
-
-      if (total_delta_parts > 0)
-        {
-          g_autofree char *formatted_total =
-            g_format_size (total_delta_part_size);
-          g_string_append_printf (buf, "Receiving delta parts: %u/%u %s/s %s/%s",
-                                  fetched_delta_parts, total_delta_parts,
-                                  formatted_bytes_sec, formatted_bytes_transferred,
-                                  formatted_total);
-
-          new_progress = (100 * bytes_transferred) / total_delta_part_size;
-        }
-      else if (outstanding_metadata_fetches)
-        {
-          /* At this point we don't really know how much data there is, so we have to make a guess.
-           * Since its really hard to figure out early how much data there is we report 1% until
-           * all objects are scanned. */
-
-          new_progress = 1;
-          estimating = TRUE;
-
-          g_string_append_printf (buf, "Receiving metadata objects: %u/(estimating) %s/s %s",
-                                  metadata_fetched, formatted_bytes_sec, formatted_bytes_transferred);
-        }
-      else
-        {
-          new_progress = (100 * fetched) / requested;
-          g_string_append_printf (buf, "Receiving objects: %u%% (%u/%u) %s/s %s",
-                                  (guint) ((((double) fetched) / requested) * 100),
-                                  fetched, requested, formatted_bytes_sec, formatted_bytes_transferred);
-        }
-    }
-  else if (outstanding_extra_data)
-    {
-      guint64 elapsed_time =
-        (current_time - ostree_async_progress_get_uint64 (progress, "start-time-extra-data")) / G_USEC_PER_SEC;
-      guint64 bytes_sec = (elapsed_time > 0) ? transferred_extra_data_bytes / elapsed_time : 0;
-      g_autofree char *formatted_bytes_transferred =
-        g_format_size_full (transferred_extra_data_bytes, 0);
-      g_autofree char *formatted_bytes_sec = NULL;
-
-      if (!bytes_sec) // Ignore first second
-        formatted_bytes_sec = g_strdup ("-");
-      else
-        formatted_bytes_sec = g_format_size (bytes_sec);
-
-      new_progress = (100 * transferred_extra_data_bytes) / total_extra_data_bytes;
-      g_string_append_printf (buf, "Downloading extra data: %u%% (%lu/%lu) %s/s %s",
-                              (guint) ((((double) transferred_extra_data_bytes) / total_extra_data_bytes) * 100),
-                              transferred_extra_data_bytes, total_extra_data_bytes, formatted_bytes_sec, formatted_bytes_transferred);
-    }
-  else if (outstanding_writes)
-    {
-      g_string_append_printf (buf, "Writing objects: %u", outstanding_writes);
-    }
-  else
-    {
-      g_string_append_printf (buf, "Scanning metadata: %u", n_scanned_metadata);
-    }
-
-  if (new_progress < last_progress)
-    new_progress = last_progress;
-  g_object_set_data (G_OBJECT (progress), "last_progress", GUINT_TO_POINTER (new_progress));
-
-  progress_cb (buf->str, new_progress, estimating, user_data);
-
-  g_string_free (buf, TRUE);
-}
-
 /**
  * flatpak_installation_install_bundle:
  * @self: a #FlatpakInstallation
  * @file: a #GFile that is an flatpak bundle
- * @progress: (scope call): progress callback
- * @progress_data: user data passed to @progress
+ * @progress: (scope call) (nullable): progress callback
+ * @progress_data: (closure progress) (nullable): user data passed to @progress
  * @cancellable: (nullable): a #GCancellable
  * @error: return location for a #GError
  *
  * Install an application or runtime from an flatpak bundle file.
- * See flatpak-build-bundle(1) for how to create brundles.
+ * See flatpak-build-bundle(1) for how to create bundles.
  *
  * Returns: (transfer full): The ref for the newly installed app or %NULL on failure
  */
@@ -1327,12 +1303,20 @@ flatpak_installation_install_ref_file (FlatpakInstallation *self,
  * @arch: (nullable): which architecture to fetch (default: current architecture)
  * @branch: (nullable): which branch to fetch (default: 'master')
  * @subpaths: (nullable): A list of subpaths to fetch, or %NULL for everything
- * @progress: (scope call): progress callback
- * @progress_data: user data passed to @progress
+ * @progress: (scope call) (nullable): progress callback
+ * @progress_data: (closure progress) (nullable): user data passed to @progress
  * @cancellable: (nullable): a #GCancellable
  * @error: return location for a #GError
  *
  * Install a new application or runtime.
+ *
+ * Note that this function was originally written to always return a
+ * #FlatpakInstalledRef. Since 0.9.13, passing
+ * FLATPAK_INSTALL_FLAGS_NO_DEPLOY will only pull refs into the local flatpak
+ * repository without deploying them, however this function will
+ * be unable to provide information on the installed ref, so
+ * FLATPAK_ERROR_ONLY_PULLED will be set and the caller must respond
+ * accordingly.
  *
  * Returns: (transfer full): The ref for the newly installed app or %NULL on failure
  */
@@ -1381,15 +1365,29 @@ flatpak_installation_install_full (FlatpakInstallation    *self,
   g_main_context_push_thread_default (main_context);
 
   if (progress)
-    {
-      ostree_progress = ostree_async_progress_new_and_connect (progress_cb, progress_data);
-      g_object_set_data (G_OBJECT (ostree_progress), "callback", progress);
-      g_object_set_data (G_OBJECT (ostree_progress), "last_progress", GUINT_TO_POINTER (0));
-    }
+    ostree_progress = flatpak_progress_new (progress, progress_data);
+  else
+    ostree_progress = ostree_async_progress_new_and_connect (no_progress_cb, NULL);
 
-  if (!flatpak_dir_install (dir_clone, FALSE, FALSE, ref, remote_name, (const char **)subpaths,
+  if (!flatpak_dir_install (dir_clone,
+                            (flags & FLATPAK_INSTALL_FLAGS_NO_PULL) != 0,
+                            (flags & FLATPAK_INSTALL_FLAGS_NO_DEPLOY) != 0,
+                            (flags & FLATPAK_INSTALL_FLAGS_NO_STATIC_DELTAS) != 0,
+                            ref, remote_name, (const char **)subpaths,
                             ostree_progress, cancellable, error))
     goto out;
+
+  /* Note that if the caller sets FLATPAK_INSTALL_FLAGS_NO_DEPLOY we must
+   * always return an error, as explained above. Otherwise get_ref will
+   * always return an error. */
+  if ((flags & FLATPAK_INSTALL_FLAGS_NO_DEPLOY) != 0)
+    {
+      g_set_error (error,
+                   FLATPAK_ERROR, FLATPAK_ERROR_ONLY_PULLED,
+                   "As requested, %s was only pulled, but not installed",
+                   name);
+      goto out;
+    }
 
   result = get_ref (dir, ref, cancellable, error);
   if (result == NULL)
@@ -1413,12 +1411,20 @@ out:
  * @name: name of the app/runtime to fetch
  * @arch: (nullable): which architecture to fetch (default: current architecture)
  * @branch: (nullable): which branch to fetch (default: 'master')
- * @progress: (scope call): progress callback
- * @progress_data: user data passed to @progress
+ * @progress: (scope call) (nullable): progress callback
+ * @progress_data: (closure progress) (nullable): user data passed to @progress
  * @cancellable: (nullable): a #GCancellable
  * @error: return location for a #GError
  *
  * Install a new application or runtime.
+ *
+ * Note that this function was originally written to always return a
+ * #FlatpakInstalledRef. Since 0.9.13, passing
+ * FLATPAK_INSTALL_FLAGS_NO_DEPLOY will only pull refs into the local flatpak
+ * repository without deploying them, however this function will
+ * be unable to provide information on the installed ref, so
+ * FLATPAK_ERROR_ONLY_PULLED will be set and the caller must respond
+ * accordingly.
  *
  * Returns: (transfer full): The ref for the newly installed app or %NULL on failure
  */
@@ -1449,8 +1455,8 @@ flatpak_installation_install (FlatpakInstallation    *self,
  * @arch: (nullable): architecture of the app or runtime to update (default: current architecture)
  * @branch: (nullable): name of the branch of the app or runtime to update (default: master)
  * @subpaths: (nullable): A list of subpaths to fetch, or %NULL for everything
- * @progress: (scope call): the callback
- * @progress_data: user data passed to @progress
+ * @progress: (scope call) (nullable): the callback
+ * @progress_data: (closure progress) (nullable): user data passed to @progress
  * @cancellable: (nullable): a #GCancellable
  * @error: return location for a #GError
  *
@@ -1479,6 +1485,8 @@ flatpak_installation_update_full (FlatpakInstallation    *self,
   g_autoptr(OstreeAsyncProgress) ostree_progress = NULL;
   g_autofree char *remote_name = NULL;
   FlatpakInstalledRef *result = NULL;
+  g_autofree char *target_commit = NULL;
+  g_auto(OstreeRepoFinderResultv) check_results = NULL;
 
   ref = flatpak_compose_ref (kind == FLATPAK_REF_KIND_APP, name, branch, arch, error);
   if (ref == NULL)
@@ -1497,6 +1505,14 @@ flatpak_installation_update_full (FlatpakInstallation    *self,
   if (remote_name == NULL)
     return NULL;
 
+  target_commit = flatpak_dir_check_for_update (dir, ref, remote_name, NULL,
+                                                (const char **)subpaths,
+                                                (flags & FLATPAK_UPDATE_FLAGS_NO_PULL) != 0,
+                                                &check_results,
+                                                cancellable, error);
+  if (target_commit == NULL)
+    return NULL;
+
   /* Pull, prune, etc are not threadsafe, so we work on a copy */
   dir_clone = flatpak_dir_clone (dir);
   if (!flatpak_dir_ensure_repo (dir_clone, cancellable, error))
@@ -1507,16 +1523,18 @@ flatpak_installation_update_full (FlatpakInstallation    *self,
   g_main_context_push_thread_default (main_context);
 
   if (progress)
-    {
-      ostree_progress = ostree_async_progress_new_and_connect (progress_cb, progress_data);
-      g_object_set_data (G_OBJECT (ostree_progress), "callback", progress);
-      g_object_set_data (G_OBJECT (ostree_progress), "last_progress", GUINT_TO_POINTER (0));
-    }
+    ostree_progress = flatpak_progress_new (progress, progress_data);
+  else
+    ostree_progress = ostree_async_progress_new_and_connect (no_progress_cb, NULL);
 
   if (!flatpak_dir_update (dir_clone,
                            (flags & FLATPAK_UPDATE_FLAGS_NO_PULL) != 0,
                            (flags & FLATPAK_UPDATE_FLAGS_NO_DEPLOY) != 0,
-                           ref, remote_name, NULL, NULL,
+                           (flags & FLATPAK_UPDATE_FLAGS_NO_STATIC_DELTAS) != 0,
+                           FALSE,
+                           ref, remote_name, target_commit,
+                           (const OstreeRepoFinderResult * const *) check_results,
+                           (const char **)subpaths,
                            ostree_progress, cancellable, error))
     goto out;
 
@@ -1542,8 +1560,8 @@ out:
  * @name: name of the app or runtime to update
  * @arch: (nullable): architecture of the app or runtime to update (default: current architecture)
  * @branch: (nullable): name of the branch of the app or runtime to update (default: master)
- * @progress: (scope call): the callback
- * @progress_data: user data passed to @progress
+ * @progress: (scope call) (nullable): the callback
+ * @progress_data: (closure progress) (nullable): user data passed to @progress
  * @cancellable: (nullable): a #GCancellable
  * @error: return location for a #GError
  *
@@ -1575,8 +1593,8 @@ flatpak_installation_update (FlatpakInstallation    *self,
  * @name: name of the app or runtime to uninstall
  * @arch: architecture of the app or runtime to uninstall
  * @branch: name of the branch of the app or runtime to uninstall
- * @progress: (scope call): the callback
- * @progress_data: user data passed to @progress
+ * @progress: (scope call) (nullable): the callback
+ * @progress_data: (closure progress) (nullable): user data passed to @progress
  * @cancellable: (nullable): a #GCancellable
  * @error: return location for a #GError
  *
@@ -1790,13 +1808,8 @@ flatpak_installation_fetch_remote_ref_sync (FlatpakInstallation *self,
     return flatpak_remote_ref_new (ref, checksum, remote_name);
 
   g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
-               "Reference %s doesn't exist in remote\n", ref);
+               "Reference %s doesn't exist in remote", ref);
   return NULL;
-}
-
-static void
-no_progress_cb (OstreeAsyncProgress *progress, gpointer user_data)
-{
 }
 
 /**
@@ -1809,6 +1822,7 @@ no_progress_cb (OstreeAsyncProgress *progress, gpointer user_data)
  * @error: return location for a #GError
  *
  * Updates the local copy of appstream for @remote_name for the specified @arch.
+ * If you need progress feedback, use flatpak_installation_update_appstream_full_sync().
  *
  * Returns: %TRUE on success, or %FALSE on error
  */
@@ -1819,6 +1833,37 @@ flatpak_installation_update_appstream_sync (FlatpakInstallation *self,
                                             gboolean            *out_changed,
                                             GCancellable        *cancellable,
                                             GError             **error)
+{
+  return flatpak_installation_update_appstream_full_sync (self, remote_name, arch,
+                                                          NULL, NULL, out_changed,
+                                                          cancellable, error);
+
+}
+
+/**
+ * flatpak_installation_update_appstream_full_sync:
+ * @self: a #FlatpakInstallation
+ * @remote_name: the name of the remote
+ * @arch: Architecture to update, or %NULL for the local machine arch
+ * @progress: (scope call) (nullable): progress callback
+ * @progress_data: (closure progress) (nullable): user data passed to @progress
+ * @out_changed: (nullable): Set to %TRUE if the contents of the appstream changed, %FALSE if nothing changed
+ * @cancellable: (nullable): a #GCancellable
+ * @error: return location for a #GError
+ *
+ * Updates the local copy of appstream for @remote_name for the specified @arch.
+ *
+ * Returns: %TRUE on success, or %FALSE on error
+ */
+gboolean
+flatpak_installation_update_appstream_full_sync (FlatpakInstallation *self,
+                                                 const char          *remote_name,
+                                                 const char          *arch,
+                                                 FlatpakProgressCallback progress,
+                                                 gpointer                progress_data,
+                                                 gboolean            *out_changed,
+                                                 GCancellable        *cancellable,
+                                                 GError             **error)
 {
   g_autoptr(FlatpakDir) dir = flatpak_installation_get_dir (self);
   g_autoptr(FlatpakDir) dir_clone = NULL;
@@ -1835,7 +1880,10 @@ flatpak_installation_update_appstream_sync (FlatpakInstallation *self,
   main_context = g_main_context_new ();
   g_main_context_push_thread_default (main_context);
 
-  ostree_progress = ostree_async_progress_new_and_connect (no_progress_cb, NULL);
+  if (progress)
+    ostree_progress = flatpak_progress_new (progress, progress_data);
+  else
+    ostree_progress = ostree_async_progress_new_and_connect (no_progress_cb, NULL);
 
   res = flatpak_dir_update_appstream (dir_clone,
                                       remote_name,
@@ -1852,6 +1900,7 @@ flatpak_installation_update_appstream_sync (FlatpakInstallation *self,
 
   return res;
 }
+
 
 /**
  * flatpak_installation_create_monitor:
@@ -1927,7 +1976,7 @@ flatpak_installation_list_remote_related_refs_sync (FlatpakInstallation *self,
       FlatpakRelated *rel = g_ptr_array_index (related, i);
       FlatpakRelatedRef *ref;
 
-      ref = flatpak_related_ref_new (rel->ref, rel->commit,
+      ref = flatpak_related_ref_new (rel->collection_id, rel->ref, rel->commit,
                                      rel->subpaths, rel->download, rel->delete);
 
       if (ref)
@@ -1983,7 +2032,7 @@ flatpak_installation_list_installed_related_refs_sync (FlatpakInstallation *self
       FlatpakRelated *rel = g_ptr_array_index (related, i);
       FlatpakRelatedRef *ref;
 
-      ref = flatpak_related_ref_new (rel->ref, rel->commit,
+      ref = flatpak_related_ref_new (rel->collection_id, rel->ref, rel->commit,
                                      rel->subpaths, rel->download, rel->delete);
 
       if (ref)

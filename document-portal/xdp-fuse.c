@@ -14,6 +14,7 @@
 #include <glib/gprintf.h>
 #include <gio/gio.h>
 #include <pthread.h>
+#include <sys/statfs.h>
 
 #include "flatpak-portal-error.h"
 #include "xdp-fuse.h"
@@ -572,7 +573,7 @@ xdp_inode_rename_child (XdpInode   *dir,
 }
 
 /* NULL if removed */
-char *
+static char *
 xdp_inode_get_filename (XdpInode *inode)
 {
   AUTOLOCK (inodes);
@@ -1042,7 +1043,7 @@ xdp_fuse_lookup (fuse_req_t  req,
   fuse_reply_entry (req, &e);
 }
 
-void
+static void
 xdp_fuse_forget (fuse_req_t req, fuse_ino_t ino, unsigned long nlookup)
 {
   g_autoptr(XdpInode) inode = NULL;
@@ -2307,10 +2308,12 @@ xdp_fuse_mainloop (gpointer data)
 gboolean
 xdp_fuse_init (GError **error)
 {
-  char *argv[] = { "xdp-fuse", "-osplice_write,splice_move,splice_read" };
+  char *argv[] = { "xdp-fuse", "-osplice_write,splice_move", "-d" };
   struct fuse_args args = FUSE_ARGS_INIT (G_N_ELEMENTS (argv), argv);
   struct stat st;
+  struct statfs stfs;
   const char *path;
+  int statfs_res;
 
   inodes =
     g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL, NULL);
@@ -2320,13 +2323,20 @@ xdp_fuse_init (GError **error)
     g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
 
   path = xdp_fuse_get_mountpoint ();
-
-  if (stat (path, &st) == -1 && errno == ENOTCONN)
+  if ((stat (path, &st) == -1 && errno == ENOTCONN) ||
+      (((statfs_res = statfs (path, &stfs)) == -1 && errno == ENOTCONN) ||
+       (statfs_res == 0 && stfs.f_type == 0x65735546 /* fuse */)))
     {
-      char *umount_argv[] = { "fusermount", "-u", (char *) path, NULL };
+      int count;
+      char *umount_argv[] = { "fusermount", "-u", "-z", (char *) path, NULL };
 
       g_spawn_sync (NULL, umount_argv, NULL, G_SPAWN_SEARCH_PATH,
                     NULL, NULL, NULL, NULL, NULL, NULL);
+
+      g_usleep (10000); /* 10ms */
+      count = 0;
+      while (stat (path, &st) == -1 && count < 10)
+        g_usleep (10000); /* 10ms */
     }
 
   if (g_mkdir_with_parents (path, 0700))

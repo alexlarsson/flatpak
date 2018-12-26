@@ -1,4 +1,4 @@
-TESTS_ENVIRONMENT += FLATPAK_TESTS_DEBUG=1 \
+AM_TESTS_ENVIRONMENT = FLATPAK_TESTS_DEBUG=1 \
 	FLATPAK_TRIGGERSDIR=$$(cd $(top_srcdir) && pwd)/triggers \
 	FLATPAK_DBUSPROXY=$$(cd $(top_builddir) && pwd)/flatpak-dbus-proxy \
 	GI_TYPELIB_PATH=$$(cd $(top_builddir) && pwd)$${GI_TYPELIB_PATH:+:$$GI_TYPELIB_PATH} \
@@ -7,13 +7,14 @@ TESTS_ENVIRONMENT += FLATPAK_TESTS_DEBUG=1 \
 	$(NULL)
 
 if WITH_SYSTEM_BWRAP
-TESTS_ENVIRONMENT += FLATPAK_BWRAP=$(BWRAP)
+AM_TESTS_ENVIRONMENT += FLATPAK_BWRAP=$(BWRAP)
 else
-TESTS_ENVIRONMENT += FLATPAK_BWRAP=$$(cd $(top_builddir) && pwd)/flatpak-bwrap
+AM_TESTS_ENVIRONMENT += FLATPAK_BWRAP=$$(cd $(top_builddir) && pwd)/flatpak-bwrap
 endif
 
-testdb_CFLAGS = $(BASE_CFLAGS)
+testdb_CFLAGS = $(AM_CFLAGS) $(BASE_CFLAGS)
 testdb_LDADD = \
+             $(AM_LDADD) \
              $(BASE_LIBS) \
              $(OSTREE_LIBS) \
              libglnx.la \
@@ -21,17 +22,20 @@ testdb_LDADD = \
              $(NULL)
 testdb_SOURCES = tests/testdb.c
 
-test_doc_portal_CFLAGS = $(BASE_CFLAGS)
+test_doc_portal_CFLAGS = $(AM_CFLAGS) $(BASE_CFLAGS)
 test_doc_portal_LDADD = \
+             $(AM_LDADD) \
              $(BASE_LIBS) \
              $(OSTREE_LIBS) \
              libglnx.la \
              libflatpak-common.la \
              $(NULL)
-test_doc_portal_SOURCES = tests/test-doc-portal.c $(xdp_dbus_built_sources)
+test_doc_portal_SOURCES = tests/test-doc-portal.c
+nodist_test_doc_portal_SOURCES = $(xdp_dbus_built_sources)
 
-testlibrary_CFLAGS = $(BASE_CFLAGS)
+testlibrary_CFLAGS = $(AM_CFLAGS) $(BASE_CFLAGS)
 testlibrary_LDADD = \
+             $(AM_LDADD) \
              $(BASE_LIBS) \
              libglnx.la \
              libflatpak.la \
@@ -74,27 +78,21 @@ tests/test-basic.sh: tests/package_version.txt
 
 dist_installed_test_extra_scripts += \
 	buildutil/tap-driver.sh \
-	tests/empty-configure \
-	tests/test-configure \
 	tests/make-test-app.sh \
 	tests/make-test-runtime.sh \
 	tests/make-test-bundles.sh \
-	tests/testpython.py \
+	tests/test-webserver.sh \
 	$(NULL)
 
 dist_installed_test_data = \
 	tests/libtest.sh \
 	tests/org.test.Hello.png \
 	tests/package_version.txt \
-	tests/test.json \
 	tests/session.conf.in \
-	tests/0001-Add-test-logo.patch \
-	tests/org.test.Python.json \
-	tests/importme.py \
-	tests/importme2.py \
 	$(NULL)
 
 installed_test_keyringdir = $(installed_testdir)/test-keyring
+installed_test_keyring2dir = $(installed_testdir)/test-keyring2
 installed_test_dbsdir = $(installed_testdir)/dbs
 
 if ENABLE_INSTALLED_TESTS
@@ -102,6 +100,11 @@ dist_installed_test_keyring_DATA = \
 	tests/test-keyring/README \
 	tests/test-keyring/pubring.gpg \
 	tests/test-keyring/secring.gpg \
+	$(NULL)
+dist_installed_test_keyring2_DATA = \
+	tests/test-keyring2/README \
+	tests/test-keyring2/pubring.gpg \
+	tests/test-keyring2/secring.gpg \
 	$(NULL)
 dist_installed_test_dbs_DATA = tests/dbs/no_tables
 endif
@@ -112,12 +115,16 @@ dist_test_scripts = \
 	tests/test-run-system.sh \
 	tests/test-run-deltas.sh \
 	tests/test-run-system-deltas.sh \
+	tests/test-repo.sh \
+	tests/test-repo-collections.sh \
+	tests/test-repo-collections-server-only.sh \
+	tests/test-repo-system.sh \
 	tests/test-extensions.sh \
 	tests/test-bundle.sh \
 	tests/test-bundle-system.sh \
-	tests/test-builder.sh \
-	tests/test-builder-python.sh \
 	tests/test-oci.sh \
+	tests/test-unsigned-summaries.sh \
+	tests/test-update-remote-configuration.sh \
 	$(NULL)
 
 test_programs = testdb test-doc-portal testlibrary

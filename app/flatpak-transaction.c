@@ -20,12 +20,12 @@
 
 #include "config.h"
 
+#include <stdio.h>
 #include <glib/gi18n.h>
 
 #include "flatpak-transaction.h"
 #include "flatpak-utils.h"
 #include "flatpak-builtins-utils.h"
-#include "flatpak-oci-registry.h"
 #include "flatpak-error.h"
 
 typedef struct FlatpakTransactionOp FlatpakTransactionOp;
@@ -56,6 +56,7 @@ struct FlatpakTransaction {
   gboolean no_interaction;
   gboolean no_pull;
   gboolean no_deploy;
+  gboolean no_static_deltas;
   gboolean add_deps;
   gboolean add_related;
 };
@@ -106,7 +107,7 @@ ref_is_installed (FlatpakTransaction *self,
 }
 
 static gboolean
-dir_ref_is_installed (FlatpakDir *dir, const char *ref, char **remote_out)
+dir_ref_is_installed (FlatpakDir *dir, const char *ref, char **remote_out, GVariant **deploy_data_out)
 {
   g_autoptr(GVariant) deploy_data = NULL;
 
@@ -116,6 +117,10 @@ dir_ref_is_installed (FlatpakDir *dir, const char *ref, char **remote_out)
 
   if (remote_out)
     *remote_out = g_strdup (flatpak_deploy_data_get_origin (deploy_data));
+
+  if (deploy_data_out)
+    *deploy_data_out = g_variant_ref (deploy_data);
+
   return TRUE;
 }
 
@@ -156,6 +161,7 @@ flatpak_transaction_new (FlatpakDir *dir,
                          gboolean no_interaction,
                          gboolean no_pull,
                          gboolean no_deploy,
+                         gboolean no_static_deltas,
                          gboolean add_deps,
                          gboolean add_related)
 {
@@ -167,6 +173,7 @@ flatpak_transaction_new (FlatpakDir *dir,
   t->no_interaction = no_interaction;
   t->no_pull = no_pull;
   t->no_deploy = no_deploy;
+  t->no_static_deltas = no_static_deltas;
   t->add_deps = add_deps;
   t->add_related = add_related;
   return t;
@@ -185,7 +192,7 @@ flatpak_transaction_free (FlatpakTransaction *self)
   g_free (self);
 }
 
-gboolean
+static gboolean
 flatpak_transaction_contains_ref (FlatpakTransaction *self,
                                   const char *ref)
 {
@@ -238,7 +245,7 @@ kind_to_str (FlatpakTransactionOpKind kind)
   return "unknown";
 }
 
-FlatpakTransactionOp *
+static FlatpakTransactionOp *
 flatpak_transaction_add_op (FlatpakTransaction *self,
                             const char *remote,
                             const char *ref,
@@ -417,7 +424,7 @@ add_deps (FlatpakTransaction *self,
       else
         {
           /* Update if in same dir */
-          if (dir_ref_is_installed (self->dir, full_runtime_ref, &runtime_remote))
+          if (dir_ref_is_installed (self->dir, full_runtime_ref, &runtime_remote, NULL))
             {
               FlatpakTransactionOp *op;
               g_debug ("Updating dependent runtime %s", full_runtime_ref);
@@ -456,7 +463,7 @@ flatpak_transaction_add_ref (FlatpakTransaction *self,
 
   if (kind == FLATPAK_TRANSACTION_OP_KIND_UPDATE)
     {
-      if (!dir_ref_is_installed (self->dir, ref, &origin))
+      if (!dir_ref_is_installed (self->dir, ref, &origin, NULL))
         {
           g_set_error (error, FLATPAK_ERROR, FLATPAK_ERROR_NOT_INSTALLED,
                        _("%s not installed"), pref);
@@ -473,11 +480,10 @@ flatpak_transaction_add_ref (FlatpakTransaction *self,
   else if (kind == FLATPAK_TRANSACTION_OP_KIND_INSTALL)
     {
       g_assert (remote != NULL);
-      if (dir_ref_is_installed (self->dir, ref, NULL))
+      if (dir_ref_is_installed (self->dir, ref, NULL, NULL))
         {
-          g_set_error (error, FLATPAK_ERROR, FLATPAK_ERROR_ALREADY_INSTALLED,
-                       _("%s already installed"), pref);
-          return FALSE;
+          g_printerr (_("%s already installed, skipping\n"), pref);
+          return TRUE;
         }
     }
 
@@ -579,73 +585,66 @@ flatpak_transaction_add_install_bundle (FlatpakTransaction *self,
 }
 
 gboolean
-flatpak_transaction_add_install_oci (FlatpakTransaction  *self,
-                                     const char         *uri,
-                                     const char         *tag,
-                                     GError             **error)
-{
-  GHashTable *annotations;
-  g_autofree char *ref = NULL;
-  g_autofree char *checksum = NULL;
-  g_autoptr(FlatpakOciManifest) manifest = NULL;
-  g_autoptr(FlatpakOciRegistry) registry = NULL;
-  const char *all_paths[] = { NULL };
-  g_autofree char *remote = NULL;
-  g_autofree char *title = NULL;
-  g_auto(GStrv) parts = NULL;
-  g_autofree char *id = NULL;
-
-  registry = flatpak_oci_registry_new (uri, FALSE, -1, NULL, error);
-  if (registry == NULL)
-    return FALSE;
-
-  manifest = flatpak_oci_registry_chose_image (registry, tag, NULL,
-                                               NULL, error);
-  if (manifest == NULL)
-    return FALSE;
-
-  /* TODO: Extract runtime dependencies and related refs */
-  annotations = flatpak_oci_manifest_get_annotations (manifest);
-  if (annotations)
-    flatpak_oci_parse_commit_annotations (annotations, NULL,
-                                          NULL, NULL,
-                                          &ref, &checksum, NULL,
-                                          NULL);
-
-  if (ref == NULL)
-    return flatpak_fail (error, _("OCI image is not a flatpak (missing ref)"));
-
-  parts = flatpak_decompose_ref (ref, error);
-  if (parts == NULL)
-    return FALSE;
-
-  title = g_strdup_printf ("OCI remote for %s", parts[1]);
-
-  id = g_strdup_printf ("oci-%s", parts[1]);
-
-  remote = flatpak_dir_create_origin_remote (self->dir, NULL,
-                                             id, title,
-                                             ref, uri, tag, NULL,
-                                             NULL, error);
-  if (remote == NULL)
-    return FALSE;
-
-  if (!flatpak_dir_recreate_repo (self->dir, NULL, error))
-    return FALSE;
-
-  g_debug ("Added OCI origin remote %s", remote);
-
-  return flatpak_transaction_add_ref (self, remote, ref, all_paths, checksum, FLATPAK_TRANSACTION_OP_KIND_INSTALL, NULL, NULL, error);
-}
-
-gboolean
 flatpak_transaction_add_update (FlatpakTransaction *self,
                                 const char *ref,
                                 const char **subpaths,
                                 const char *commit,
                                 GError **error)
 {
+  const char *all_paths[] = { NULL };
+
+  /* If specify an empty subpath, that means all subpaths */
+  if (subpaths != NULL && subpaths[0] != NULL && subpaths[0][0] == 0)
+    subpaths = all_paths;
+
   return flatpak_transaction_add_ref (self, NULL, ref, subpaths, commit, FLATPAK_TRANSACTION_OP_KIND_UPDATE, NULL, NULL, error);
+}
+
+gboolean
+flatpak_transaction_update_metadata (FlatpakTransaction  *self,
+                                     gboolean             all_remotes,
+                                     GCancellable        *cancellable,
+                                     GError             **error)
+{
+  g_auto(GStrv) remotes = NULL;
+  int i;
+  GList *l;
+
+  /* Collect all dir+remotes used in this transaction */
+
+  if (all_remotes)
+    {
+      remotes = flatpak_dir_list_remotes (self->dir, NULL, error);
+      if (remotes == NULL)
+        return FALSE;
+    }
+  else
+    {
+      g_autoptr(GHashTable) ht = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+      for (l = self->ops; l != NULL; l = l->next)
+        {
+          FlatpakTransactionOp *op = l->data;
+          g_hash_table_add (ht, g_strdup (op->remote));
+        }
+      remotes = (char **)g_hash_table_get_keys_as_array (ht, NULL);
+      g_hash_table_steal_all (ht); /* Move ownership to remotes */
+    }
+
+  /* Update metadata for said remotes */
+  for (i = 0; remotes[i] != NULL; i++)
+    {
+      char *remote = remotes[i];
+
+      g_debug ("Updating remote metadata for %s", remote);
+      if (!flatpak_dir_update_remote_configuration (self->dir, remote, cancellable, error))
+        return FALSE;
+    }
+
+  /* Reload changed configuration */
+  if (!flatpak_dir_recreate_repo (self->dir, cancellable, error))
+    return FALSE;
+
+  return TRUE;
 }
 
 gboolean
@@ -667,57 +666,104 @@ flatpak_transaction_run (FlatpakTransaction *self,
       const char *pref;
       const char *opname;
       FlatpakTransactionOpKind kind;
+      FlatpakTerminalProgress terminal_progress = { 0 };
 
       kind = op->kind;
       if (kind == FLATPAK_TRANSACTION_OP_KIND_INSTALL_OR_UPDATE)
         {
-          if (dir_ref_is_installed (self->dir, op->ref, NULL))
-            kind = FLATPAK_TRANSACTION_OP_KIND_UPDATE;
+          g_autoptr(GVariant) deploy_data = NULL;
+
+          if (dir_ref_is_installed (self->dir, op->ref, NULL, &deploy_data))
+            {
+              g_autofree const char **current_subpaths = NULL;
+
+              /* When we update a dependency, we always inherit the subpaths
+                 rather than use the default. */
+              g_strfreev (op->subpaths);
+              current_subpaths = flatpak_deploy_data_get_subpaths (deploy_data);
+              op->subpaths = g_strdupv ((char **)current_subpaths);
+
+              /* Don't use the remote from related ref on update, always use
+                 the current remote. */
+              g_free (op->remote);
+              op->remote = g_strdup (flatpak_deploy_data_get_origin (deploy_data));
+
+              kind = FLATPAK_TRANSACTION_OP_KIND_UPDATE;
+            }
           else
             kind = FLATPAK_TRANSACTION_OP_KIND_INSTALL;
         }
 
       pref = strchr (op->ref, '/') + 1;
 
+
       if (kind == FLATPAK_TRANSACTION_OP_KIND_INSTALL)
         {
+          g_autoptr(OstreeAsyncProgress) progress = flatpak_progress_new (flatpak_terminal_progress_cb, &terminal_progress);
           opname = _("install");
           g_print (_("Installing: %s from %s\n"), pref, op->remote);
           res = flatpak_dir_install (self->dir,
                                      self->no_pull,
                                      self->no_deploy,
+                                     self->no_static_deltas,
                                      op->ref, op->remote,
                                      (const char **)op->subpaths,
-                                     NULL,
+                                     progress,
                                      cancellable, &local_error);
+          ostree_async_progress_finish (progress);
+          flatpak_terminal_progress_end (&terminal_progress);
         }
       else if (kind == FLATPAK_TRANSACTION_OP_KIND_UPDATE)
         {
+          g_auto(OstreeRepoFinderResultv) check_results = NULL;
+
           opname = _("update");
-          g_print (_("Updating: %s from %s\n"), pref, op->remote);
-          res = flatpak_dir_update (self->dir,
-                                    self->no_pull,
-                                    self->no_deploy,
-                                    op->ref, op->remote, op->commit,
-                                    (const char **)op->subpaths,
-                                    NULL,
-                                    cancellable, &local_error);
-
-          if (res)
+          g_autofree char *target_commit = flatpak_dir_check_for_update (self->dir, op->ref, op->remote, op->commit,
+                                                                         (const char **)op->subpaths,
+                                                                         self->no_pull,
+                                                                         &check_results,
+                                                                         cancellable, &local_error);
+          if (target_commit != NULL)
             {
-              g_autoptr(GVariant) deploy_data = NULL;
-              g_autofree char *commit = NULL;
-              deploy_data = flatpak_dir_get_deploy_data (self->dir, op->ref, NULL, NULL);
-              commit = g_strndup (flatpak_deploy_data_get_commit (deploy_data), 12);
-              g_print (_("Now at %s.\n"), commit);
+              g_print (_("Updating: %s from %s\n"), pref, op->remote);
+              g_autoptr(OstreeAsyncProgress) progress = flatpak_progress_new (flatpak_terminal_progress_cb, &terminal_progress);
+              res = flatpak_dir_update (self->dir,
+                                        self->no_pull,
+                                        self->no_deploy,
+                                        self->no_static_deltas,
+                                        op->commit != NULL, /* Allow downgrade if we specify commit */
+                                        op->ref, op->remote, target_commit,
+                                        (const OstreeRepoFinderResult * const *) check_results,
+                                        (const char **)op->subpaths,
+                                        progress,
+                                        cancellable, &local_error);
+              ostree_async_progress_finish (progress);
+              flatpak_terminal_progress_end (&terminal_progress);
+              if (res)
+                {
+                  g_autoptr(GVariant) deploy_data = NULL;
+                  g_autofree char *commit = NULL;
+                  deploy_data = flatpak_dir_get_deploy_data (self->dir, op->ref, NULL, NULL);
+                  commit = g_strndup (flatpak_deploy_data_get_commit (deploy_data), 12);
+                  g_print (_("Now at %s.\n"), commit);
+                }
+
+              /* Handle noop-updates */
+              if (!res && g_error_matches (local_error, FLATPAK_ERROR, FLATPAK_ERROR_ALREADY_INSTALLED))
+                {
+                  g_print (_("No updates.\n"));
+                  res = TRUE;
+                  g_clear_error (&local_error);
+                }
             }
-
-          /* Handle noop-updates */
-          if (!res && g_error_matches (local_error, FLATPAK_ERROR, FLATPAK_ERROR_ALREADY_INSTALLED))
+          else
             {
-              g_print (_("No updates.\n"));
-              res = TRUE;
-              g_clear_error (&local_error);
+              res = FALSE;
+              if (g_error_matches (local_error, FLATPAK_ERROR, FLATPAK_ERROR_ALREADY_INSTALLED))
+                {
+                  res = TRUE;
+                  g_clear_error (&local_error);
+                }
             }
         }
       else if (kind == FLATPAK_TRANSACTION_OP_KIND_BUNDLE)

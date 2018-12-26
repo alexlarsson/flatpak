@@ -97,6 +97,7 @@ static FlatpakCommand commands[] = {
   { "build-sign", N_("Sign an application or runtime"), flatpak_builtin_build_sign, flatpak_complete_build_sign },
   { "build-update-repo", N_("Update the summary file in a repository"), flatpak_builtin_build_update_repo, flatpak_complete_build_update_repo },
   { "build-commit-from", N_("Create new commit based on existing ref"), flatpak_builtin_build_commit_from, flatpak_complete_build_commit_from },
+  { "repo", N_("Print information about a repo"), flatpak_builtin_repo, flatpak_complete_repo },
 
   { NULL }
 };
@@ -119,7 +120,7 @@ static GOptionEntry empty_entries[] = {
 GOptionEntry user_entries[] = {
   { "user", 0, 0, G_OPTION_ARG_NONE, &opt_user, N_("Work on user installations"), NULL },
   { "system", 0, G_OPTION_FLAG_REVERSE, G_OPTION_ARG_NONE, &opt_user, N_("Work on system-wide installations (default)"), NULL },
-  { "installation", 0, 0, G_OPTION_ARG_STRING, &opt_installation, N_("Work on a specific system-wide installation"), NULL },
+  { "installation", 0, 0, G_OPTION_ARG_STRING, &opt_installation, N_("Work on a specific system-wide installation"), N_("NAME") },
   { NULL }
 };
 
@@ -136,7 +137,7 @@ message_handler (const gchar   *log_domain,
     g_printerr ("%s: %s\n", g_get_prgname (), message);
 }
 
-GOptionContext *
+static GOptionContext *
 flatpak_option_context_new_with_commands (FlatpakCommand *commands)
 {
   GOptionContext *context;
@@ -172,7 +173,7 @@ flatpak_option_context_new_with_commands (FlatpakCommand *commands)
   return context;
 }
 
-int
+static int
 flatpak_usage (FlatpakCommand *commands,
                gboolean        is_error)
 {
@@ -291,7 +292,7 @@ usage_error (GOptionContext *context, const char *message, GError **error)
   return FALSE;
 }
 
-FlatpakCommand *
+static FlatpakCommand *
 extract_command (int     *argc,
                  char   **argv,
                  const char **command_name_out)
@@ -339,7 +340,7 @@ extract_command (int     *argc,
 }
 
 
-int
+static int
 flatpak_run (int      argc,
              char   **argv,
              GError **res_error)
@@ -480,13 +481,12 @@ main (int    argc,
 
   if (error != NULL)
     {
-      int is_tty = isatty (1);
       const char *prefix = "";
       const char *suffix = "";
-      if (is_tty)
+      if (flatpak_fancy_output ())
         {
-          prefix = "\x1b[31m\x1b[1m"; /* red, bold */
-          suffix = "\x1b[22m\x1b[0m"; /* bold off, color reset */
+          prefix = FLATPAK_ANSI_RED FLATPAK_ANSI_BOLD_ON;
+          suffix = FLATPAK_ANSI_BOLD_OFF FLATPAK_ANSI_COLOR_RESET;
         }
       g_printerr ("%s%s %s%s\n", prefix, _("error:"), suffix, error->message);
       g_error_free (error);

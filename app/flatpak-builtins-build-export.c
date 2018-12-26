@@ -44,6 +44,10 @@ static char **opt_include;
 static char *opt_gpg_homedir;
 static char *opt_files;
 static char *opt_metadata;
+static char *opt_timestamp = NULL;
+#ifdef FLATPAK_ENABLE_P2P
+static char *opt_collection_id = NULL;
+#endif  /* FLATPAK_ENABLE_P2P */
 
 static GOptionEntry options[] = {
   { "subject", 's', 0, G_OPTION_ARG_STRING, &opt_subject, N_("One line subject"), N_("SUBJECT") },
@@ -58,6 +62,10 @@ static GOptionEntry options[] = {
   { "exclude", 0, 0, G_OPTION_ARG_STRING_ARRAY, &opt_exclude, N_("Files to exclude"), N_("PATTERN") },
   { "include", 0, 0, G_OPTION_ARG_STRING_ARRAY, &opt_include, N_("Excluded files to include"), N_("PATTERN") },
   { "gpg-homedir", 0, 0, G_OPTION_ARG_STRING, &opt_gpg_homedir, N_("GPG Homedir to use when looking for keyrings"), N_("HOMEDIR") },
+  { "timestamp", 0, 0, G_OPTION_ARG_STRING, &opt_timestamp, N_("Override the timestamp of the commit"), N_("ISO-8601-TIMESTAMP") },
+#ifdef FLATPAK_ENABLE_P2P
+  { "collection-id", 0, 0, G_OPTION_ARG_STRING, &opt_collection_id, N_("Collection ID"), "COLLECTION-ID" },
+#endif  /* FLATPAK_ENABLE_P2P */
 
   { NULL }
 };
@@ -166,11 +174,25 @@ commit_filter (OstreeRepo *repo,
   g_file_info_set_attribute_uint32 (file_info, "unix::uid", 0);
   g_file_info_set_attribute_uint32 (file_info, "unix::gid", 0);
 
+  /* In flatpak, there is no real reason for files to have different
+   * permissions based on the group or user really, everything is
+   * always used readonly for everyone. Having things be writeable
+   * for anyone but the user just causes risks for the system-installed
+   * case. So, we canonicalize the mode to writable only by the user,
+   * readable to all, and executable for all for directories and
+   * files that the user can execute.
+  */
   mode = g_file_info_get_attribute_uint32 (file_info, "unix::mode");
-  /* No setuid */
-  mode = mode & ~07000;
-  /* All files readable */
-  mode = mode | 0444;
+  if (g_file_info_get_file_type (file_info) == G_FILE_TYPE_DIRECTORY)
+    mode = 0755 | S_IFDIR;
+  else if (g_file_info_get_file_type (file_info) == G_FILE_TYPE_REGULAR)
+    {
+      /* If use can execute, make executable by all */
+      if (mode & S_IXUSR)
+        mode = 0755 | S_IFREG;
+      else /* otherwise executable by none */
+        mode = 0644 | S_IFREG;
+    }
   g_file_info_set_attribute_uint32 (file_info, "unix::mode", mode);
 
   if (matches_patterns (commit_data->exclude, path) &&
@@ -183,7 +205,7 @@ commit_filter (OstreeRepo *repo,
   return OSTREE_REPO_COMMIT_FILTER_ALLOW;
 }
 
-gboolean
+static gboolean
 add_file_to_mtree (GFile             *file,
                    const char        *name,
                    OstreeRepo        *repo,
@@ -208,7 +230,7 @@ add_file_to_mtree (GFile             *file,
   g_file_info_set_file_type (file_info, G_FILE_TYPE_REGULAR);
   g_file_info_set_attribute_uint32 (file_info, "unix::uid", 0);
   g_file_info_set_attribute_uint32 (file_info, "unix::gid", 0);
-  g_file_info_set_attribute_uint32 (file_info, "unix::mode", 0100644);
+  g_file_info_set_attribute_uint32 (file_info, "unix::mode", 0100744);
 
   raw_input = (GInputStream *) g_file_read (file, cancellable, error);
   if (raw_input == NULL)
@@ -633,6 +655,9 @@ flatpak_builtin_build_export (int argc, char **argv, GCancellable *cancellable, 
   g_autoptr(GVariant) metadata_dict_v = NULL;
   gboolean is_runtime = FALSE;
   gboolean is_extension = FALSE;
+  guint64 installed_size = 0,download_size = 0;
+  GTimeVal ts;
+  const char *collection_id;
 
   context = g_option_context_new (_("LOCATION DIRECTORY [BRANCH] - Create a repository from a build directory"));
   g_option_context_set_translation_domain (context, GETTEXT_PACKAGE);
@@ -659,6 +684,15 @@ flatpak_builtin_build_export (int argc, char **argv, GCancellable *cancellable, 
     branch = argv[3];
   else
     branch = "master";
+
+#ifdef FLATPAK_ENABLE_P2P
+  if (opt_collection_id != NULL &&
+      !ostree_validate_collection_id (opt_collection_id, &my_error))
+    {
+      flatpak_fail (error, _("‘%s’ is not a valid collection ID: %s"), opt_collection_id, my_error->message);
+      goto out;
+    }
+#endif  /* FLATPAK_ENABLE_P2P */
 
   if (!flatpak_is_valid_branch (branch, &my_error))
     {
@@ -735,7 +769,11 @@ flatpak_builtin_build_export (int argc, char **argv, GCancellable *cancellable, 
   if (opt_body)
     body = g_strdup (opt_body);
   else
-    body = g_strconcat ("Name: ", id, "\nArch: ", arch, "\nBranch: ", branch, NULL);
+    body = g_strdup_printf ("Name: %s\n"
+                            "Arch: %s\n"
+                            "Branch: %s\n"
+                            "Built with: "PACKAGE_STRING"\n",
+                            id, arch, branch);
 
   full_branch = g_strconcat ((opt_runtime || is_runtime) ? "runtime/" : "app/", id, "/", arch, "/", branch, NULL);
 
@@ -750,12 +788,36 @@ flatpak_builtin_build_export (int argc, char **argv, GCancellable *cancellable, 
 
       if (!ostree_repo_resolve_rev (repo, full_branch, TRUE, &parent, error))
         goto out;
+
+#ifdef FLATPAK_ENABLE_P2P
+      if (opt_collection_id != NULL &&
+          g_strcmp0 (ostree_repo_get_collection_id (repo), opt_collection_id) != 0)
+        {
+          flatpak_fail (error, "Specified collection ID ‘%s’ doesn’t match collection ID in repository configuration ‘%s’.",
+                        opt_collection_id, ostree_repo_get_collection_id (repo));
+          goto out;
+        }
+#endif  /* FLATPAK_ENABLE_P2P */
     }
   else
     {
+#ifdef FLATPAK_ENABLE_P2P
+      if (opt_collection_id != NULL &&
+          !ostree_repo_set_collection_id (repo, opt_collection_id, error))
+        goto out;
+#endif  /* FLATPAK_ENABLE_P2P */
       if (!ostree_repo_create (repo, OSTREE_REPO_MODE_ARCHIVE_Z2, cancellable, error))
         goto out;
     }
+
+  /* Get the canonical collection ID which we’ll use for the commit. This might
+   * be %NULL if the existing repo doesn’t have one and none was specified on
+   * the command line. */
+#ifdef FLATPAK_ENABLE_P2P
+  collection_id = ostree_repo_get_collection_id (repo);
+#else  /* if !FLATPAK_ENABLE_P2P */
+  collection_id = NULL;
+#endif  /* !FLATPAK_ENABLE_P2P */
 
   if (!ostree_repo_prepare_transaction (repo, NULL, cancellable, error))
     goto out;
@@ -811,11 +873,51 @@ flatpak_builtin_build_export (int argc, char **argv, GCancellable *cancellable, 
   if (!ostree_repo_write_mtree (repo, mtree, &root, cancellable, error))
     goto out;
 
-  metadata_dict_v = g_variant_ref_sink (g_variant_dict_end (&metadata_dict));
-  if (!ostree_repo_write_commit (repo, parent, subject, body, metadata_dict_v,
-                                 OSTREE_REPO_FILE (root),
-                                 &commit_checksum, cancellable, error))
+  if (!flatpak_repo_collect_sizes (repo, root, &installed_size, &download_size, cancellable, error))
     goto out;
+
+  /* Binding information. xa.ref is deprecated in favour of the OSTree keys, but
+   * keep it around for backwards compatibility. Write the bindings even if
+   * we’re compiled without P2P support, since other flatpak builds might be. */
+  g_variant_dict_insert_value (&metadata_dict, "ostree.collection-binding",
+                               g_variant_new_string ((collection_id != NULL) ? collection_id : ""));
+  g_variant_dict_insert_value (&metadata_dict, "ostree.ref-binding",
+                               g_variant_new_strv ((const gchar * const *) &full_branch, 1));
+  g_variant_dict_insert_value (&metadata_dict, "xa.ref", g_variant_new_string (full_branch));
+
+  g_variant_dict_insert_value (&metadata_dict, "xa.metadata", g_variant_new_string (metadata_contents));
+  g_variant_dict_insert_value (&metadata_dict, "xa.installed-size", g_variant_new_uint64 (GUINT64_TO_BE (installed_size)));
+  g_variant_dict_insert_value (&metadata_dict, "xa.download-size", g_variant_new_uint64 (GUINT64_TO_BE (download_size)));
+
+  metadata_dict_v = g_variant_ref_sink (g_variant_dict_end (&metadata_dict));
+
+  /* required for the metadata and the AppStream commits */
+  if (opt_timestamp != NULL)
+    {
+      if (!g_time_val_from_iso8601 (opt_timestamp, &ts))
+        {
+          g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                       "Could not parse '%s'", opt_timestamp);
+          goto out;
+        }
+    }
+
+  if (opt_timestamp == NULL)
+    {
+      if (!ostree_repo_write_commit (repo, parent, subject, body, metadata_dict_v,
+                                     OSTREE_REPO_FILE (root),
+                                     &commit_checksum, cancellable, error))
+        goto out;
+    }
+  else
+    {
+      if (!ostree_repo_write_commit_with_time (repo, parent, subject, body,
+                                               metadata_dict_v,
+                                               OSTREE_REPO_FILE (root),
+                                               ts.tv_sec, &commit_checksum,
+                                               cancellable, error))
+        goto out;
+    }
 
   if (opt_gpg_key_ids)
     {
@@ -835,13 +937,24 @@ flatpak_builtin_build_export (int argc, char **argv, GCancellable *cancellable, 
         }
     }
 
-  ostree_repo_transaction_set_ref (repo, NULL, full_branch, commit_checksum);
+#ifdef FLATPAK_ENABLE_P2P
+  if (collection_id != NULL)
+    {
+      OstreeCollectionRef ref = { (char *) collection_id, full_branch };
+      ostree_repo_transaction_set_collection_ref (repo, &ref, commit_checksum);
+    }
+  else
+#endif  /* FLATPAK_ENABLE_P2P */
+    {
+      ostree_repo_transaction_set_ref (repo, NULL, full_branch, commit_checksum);
+    }
 
   if (!ostree_repo_commit_transaction (repo, &stats, cancellable, error))
     goto out;
 
   if (opt_update_appstream &&
-      !flatpak_repo_generate_appstream (repo, (const char **) opt_gpg_key_ids, opt_gpg_homedir, cancellable, error))
+      !flatpak_repo_generate_appstream (repo, (const char **) opt_gpg_key_ids, opt_gpg_homedir,
+                                        ts.tv_sec, cancellable, error))
     return FALSE;
 
   if (!opt_no_update_summary &&

@@ -44,6 +44,7 @@ AM_CPPFLAGS =							\
 	-DFLATPAK_BASEDIR=\"$(pkgdatadir)\"			\
 	-DFLATPAK_TRIGGERDIR=\"$(pkgdatadir)/triggers\"		\
 	-DSYSTEM_FONTS_DIR=\"$(SYSTEM_FONTS_DIR)\"		\
+	-DSYSTEM_FONT_CACHE_DIRS=\"$(SYSTEM_FONT_CACHE_DIRS)\"		\
 	-DDBUSPROXY=\"$(libexecdir)/flatpak-dbus-proxy\"	\
 	-DG_LOG_DOMAIN=\"flatpak\"				\
 	-I$(srcdir)/libglnx					\
@@ -51,7 +52,10 @@ AM_CPPFLAGS =							\
 	-I$(builddir)/common					\
 	-I$(srcdir)/lib						\
 	-I$(builddir)/lib					\
+	-include "config.h"					\
 	$(NULL)
+
+AM_CFLAGS = $(WARN_CFLAGS)
 
 if WITH_SYSTEM_BWRAP
 AM_CPPFLAGS += -DHELPER=\"$(BWRAP)\"
@@ -66,12 +70,17 @@ dist_triggers_SCRIPTS = \
 	triggers/desktop-database.trigger \
 	$(NULL)
 
+# This canonicalizes the PKG_CHECK_MODULES or AM_PATH_GPGME results
+INTERNAL_GPGME_CFLAGS = $(DEP_GPGME_CFLAGS) $(GPGME_PTHREAD_CFLAGS)
+INTERNAL_GPGME_LIBS = $(DEP_GPGME_LIBS) $(GPGME_PTHREAD_LIBS)
+
 lib_LTLIBRARIES =
 noinst_LTLIBRARIES += libglnx.la
 libglnx_srcpath := $(srcdir)/libglnx
 libglnx_cflags := \
 	$(BASE_CFLAGS) \
 	"-I$(libglnx_srcpath)" \
+	-std=gnu99 \
 	$(HIDDEN_VISIBILITY_CFLAGS) \
 	$(NULL)
 libglnx_libs := $(BASE_LIBS)
@@ -81,7 +90,6 @@ include common/Makefile.am.inc
 include data/Makefile.am.inc
 include app/Makefile.am.inc
 include lib/Makefile.am.inc
-include builder/Makefile.am.inc
 include session-helper/Makefile.am.inc
 include system-helper/Makefile.am.inc
 include dbus-proxy/Makefile.am.inc
@@ -93,8 +101,8 @@ if !WITH_SYSTEM_BWRAP
 
 bwrap_PROGRAMS = flatpak-bwrap
 flatpak_bwrap_SOURCES = $(bwrap_SOURCES)
-flatpak_bwrap_CFLAGS = $(bwrap_CFLAGS)
-flatpak_bwrap_LDADD = $(bwrap_LDADD)
+flatpak_bwrap_CFLAGS = $(AM_CFLAGS) $(bwrap_CFLAGS)
+flatpak_bwrap_LDADD = $(AM_LDADD) $(bwrap_LDADD)
 bwrapdir = $(libexecdir)
 include bubblewrap/Makefile-bwrap.am.inc
 
@@ -146,6 +154,10 @@ flatpak.conf: dbus.service.d/flatpak.conf.in
 pkgconfigdir = $(libdir)/pkgconfig
 pkgconfig_DATA = flatpak.pc
 EXTRA_DIST += flatpak.pc.in
+
+scriptsdir = $(bindir)
+scripts_SCRIPTS = scripts/flatpak-bisect
+EXTRA_DIST += scripts/flatpak-bisect
 
 EXTRA_DIST += README.md
 

@@ -448,6 +448,8 @@ xdg_permission_store_start (GDBusConnection *connection)
 
   store = xdg_permission_store_skeleton_new ();
 
+  xdg_permission_store_set_version (XDG_PERMISSION_STORE (store), 1);
+
   g_signal_connect (store, "handle-list", G_CALLBACK (handle_list), NULL);
   g_signal_connect (store, "handle-lookup", G_CALLBACK (handle_lookup), NULL);
   g_signal_connect (store, "handle-set", G_CALLBACK (handle_set), NULL);
@@ -460,7 +462,7 @@ xdg_permission_store_start (GDBusConnection *connection)
                                          "/org/freedesktop/impl/portal/PermissionStore",
                                          &error))
     {
-      g_warning ("error: %s\n", error->message);
+      g_warning ("error: %s", error->message);
       g_error_free (error);
     }
 }

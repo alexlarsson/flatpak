@@ -78,8 +78,12 @@ mkdir -p ${TEST_DATA_DIR}/home
 mkdir -p ${TEST_DATA_DIR}/runtime
 mkdir -p ${TEST_DATA_DIR}/system
 export FLATPAK_SYSTEM_DIR=${TEST_DATA_DIR}/system
+export FLATPAK_SYSTEM_CACHE_DIR=${TEST_DATA_DIR}/system-cache
 export FLATPAK_SYSTEM_HELPER_ON_SESSION=1
 
+export HOME=${TEST_DATA_DIR}/home
+export XDG_CACHE_HOME=${TEST_DATA_DIR}/home/cache
+export XDG_CONFIG_HOME=${TEST_DATA_DIR}/home/config
 export XDG_DATA_HOME=${TEST_DATA_DIR}/home/share
 export XDG_RUNTIME_DIR=${TEST_DATA_DIR}/runtime
 
@@ -100,7 +104,6 @@ if [ x${USE_DELTAS-} == xyes ] ; then
 fi
 
 export FLATPAK="${CMD_PREFIX} flatpak"
-export FLATPAK_BUILDER="${CMD_PREFIX} flatpak-builder"
 
 assert_streq () {
     test "$1" = "$2" || (echo 1>&2 "$1 != $2"; exit 1)
@@ -138,6 +141,14 @@ assert_not_file_has_content () {
     fi
 }
 
+assert_file_has_mode () {
+    mode=$(stat -c '%a' $1)
+    if [ "$mode" != "$2" ]; then
+        echo 1>&2 "File '$1' has wrong mode: expected $2, but got $mode"
+        exit 1
+    fi
+}
+
 assert_not_has_dir () {
     if test -d "$1"; then
 	echo 1>&2 "Directory '$1' exists"; exit 1
@@ -169,54 +180,124 @@ assert_file_empty() {
 }
 
 export FL_GPG_HOMEDIR=${TEST_DATA_DIR}/gpghome
+export FL_GPG_HOMEDIR2=${TEST_DATA_DIR}/gpghome2
 mkdir -p ${FL_GPG_HOMEDIR}
+mkdir -p ${FL_GPG_HOMEDIR2}
 # This need to be writable, so copy the keys
 cp $(dirname $0)/test-keyring/*.gpg ${FL_GPG_HOMEDIR}/
+cp $(dirname $0)/test-keyring2/*.gpg ${FL_GPG_HOMEDIR2}/
 
 export FL_GPG_ID=7B0961FD
+export FL_GPG_ID2=B2314EFC
 export FL_GPGARGS="--gpg-homedir=${FL_GPG_HOMEDIR} --gpg-sign=${FL_GPG_ID}"
+export FL_GPGARGS2="--gpg-homedir=${FL_GPG_HOMEDIR2} --gpg-sign=${FL_GPG_ID2}"
+export FL_GPG_BASE64="mQENBFbPBvoBCADWbz5O+XzuyN+dDExK81pci+gIzBNWB+7SsN0EgoJppKgwBCX+Bd6ERe9Yz0nJbJB/tjazRp7MnnoPnh6fXnhIbHA766/Eciy4sL5X8laqDmWmROCqCe79QZH/w6vYTKsDmoLQrw9eKRP1ilCvECNGcVdhIyfTDlNrU//uy5U4h2PVUz1/Al87lvaJnrj5423m5GnX+qpEG8mmpmcw52lvXNPuC95ykylPQJjI0WnOuaTcxzRhm5eHPkqKQ+nPIS+66iw1SFdobYuye/vg/rDiyp8uyQkh7FWXnzHxz4J8ovesnrCM7pKI4VEHCnZ4/sj2v9E3l0wJlqZxLTULaV3lABEBAAG0D1hkZy1hcHAgdGVzdGluZ4kBOAQTAQIAIgUCVs8G+gIbAwYLCQgHAwIGFQgCCQoLBBYCAwECHgECF4AACgkQE4sx4HsJYf2DiAf7BQ8anU3CgYpJjuO2rT8jQPO0jGRCNaPyaeAcBx8IjFkjf8daKMPCAt6gQioEpC8OhDig86Bl5piYOB7L7JSB53mgUrADJXhgC/dG4soCt7/U4wW30MseXdlXSOqHGApblF/bIs4B30OBGReBj3DcWIqyb48GraSKlPlaCpkZFySNEAcGUCeCqbbygxCQAM8MDq9FgVRk5oVrE/nAUm6oScEBhseoB7+CaHaRTmLoe/SBs0z2AJ7alIH1Sv4X3mQXpfsAIcWf3Zu2MZydF/Vuh8vTMROwPYtOVEtGxZvEBN3h5uc88dHSk928maqsop9T6oEwM43mBKCOu1gdAOw4OLkBDQRWzwb6AQgAx/XuEaQvdI3J2YYmOE6RY0jJZXLauXH46cJR4q70mlDev/OqYKTSLlo4q06D4ozCwzTYflppDak7kmjWMN224/u1koqFOtF76LsglAeLaQmweWmX0ecbPrzFYaX30kaQAqQ9Wk0PRe0+arRzWDWfUv3qX3y1decKUrBCuEC6WvVVwooWs+zX0cUBS8CROhazTjvXFAz36mhK0u+B3WCBlK+T2tIPOjLjlYgzYARw+X7/J6B3C798r2Hw/yXqCDcKLrq7WWUB33kv3buuG2G6LUamctdD8IsTBxi+nIjAvQITFqq4cPbbXAJGaAnWGuLOddQ9e/GhCOI4JjopRnnjOwARAQABiQEfBBgBAgAJBQJWzwb6AhsMAAoJEBOLMeB7CWH9TC8H/A6oreCxeiL8DPOWN29OaQ5sEw7Dg7bnLSZLu8aREgwfCiFSv0numOABjn/G89Y5M6NiEXFZZhUa+SXOALiBLUy98O84lyp9hlP9qGbWRgBXwe5vOAJERqtoUwR5bygpAw5Nc4y3wddPC4vH7upJ8ftU/eEFtPdI0cKrrAZDFdhXFp3RxdCC6fD62wbofE0mo1Ea1iD3xqVh2t7jfWN1RhMV308htHRGkkmWcEbbvHqugwL6dWZEvQmLYi6/7tQyA1KdG4AZksBP/MBi3t2hthRqQx1v52JwdCaZNuItuEe5rWXhfvoGxPoqYZt9ZPjna6yJfcfJwPbMfjNwX2LR4p4="
+export FL_GPG_BASE642="mQENBFkSyx4BCACq/8XFcF+NTpJKfoo8F6YyR8RQXww6kCV47zN78Dt7aCh43WSYLRUBRt1tW5MRT8R60pwCsGvKnFiNS2Vqe4T1IW4mDnFMZIZJXdNVwKUqVBPL/jzkIDnQ9NXtuPNH0qET6VhYnb9aykLo/MiBmx6q+4MvYd/qwiN8kstRifRIxjjZx6wsg+muY6yx9fZKxlgvhc3nsrl3oyDo7/+V+b3heYLtMCQFwlHRKz3Yf2X9H0aUSbDYcgTy6w3q94HVNCpJSqeiR+kBG175BQYKR2l7WYdaVPFf5LMEvAJh0SGnqu77X+8TYYRQiiBB5fYjGOeHfOh6uH5GAJRQymVIJwy/ABEBAAG0KkZsYXRwYWsgKFRlc3Qga2V5IDIpIDxmbGF0cGFrQGZsYXRwYWsub3JnPokBOAQTAQIAIgUCWRLLHgIbAwYLCQgHAwIGFQgCCQoLBBYCAwECHgECF4AACgkQdZ9f0LIxTvyeUQf/euAZpipXBkGWxeW4G10r1QRi2tZAWNeLpy8SB17eo9E6yB61SdH80jALborVs/plnZzKcFf+nLvjCn51FLMh6QPL3S+079WHsed//qtUWfbJ85hLevfCMTZMLktUmqwwUh238WW/gKtbUjYOqr1IZSMBoMiQtc0iOVBP7HUdhYigxTKvs/MBEGHANeQkY07ZnX9oFXElOo+EIPAHScwEOSwEVrXUVHpQODzIfjOoPUHWAZtM1yJT+iWmVHe4HtU8CyBnPyUcnTmTWKr92QmgfWkb1T7ugT5gXt/6ZlYAaZGnr9yNuSk3MMhDMOyldtJBM5Zl8eScE9KBf7pRJoxnMLkBDQRZEsseAQgAvA29IyiJpB+jUHj3MOyVyTBOmvLme+0Ndhpt/mTh+swchJUvzb0IzQS9Le5yVAvn+ppAtDCMb+bV4Xh5zrbiH0Hu0qwK4Qk+KcIKRE8ImDiUM8NFE2SZoomZSsgZ1NBWbAdEyVpkBfrt3Dd8FssMrwPF6kqo02TZr7Pxng+BEHUZT6jPCxueqyXyv2cLbQMe1H0U7klsxPmnnIYUqdwOmPxUspVEYP9oJb5y123mx0yj5JuYdZMjWbP3cRLox1RKIlFWgQqOn2yJiEoWzpqdbtb7sE3ggnbZKJED0ZxUZIakjnyMhX+GAEA8ZMZ6+HfDt1iHV8qHcYiLW5A3AQTxZwARAQABiQEfBBgBAgAJBQJZEsseAhsMAAoJEHWfX9CyMU78Ns4IAJRQ5UJ9KkeZClHm1EjYlgsAq1UJr9wgbyBFKTEkGZ/CAvVmgg+BUXcN/SPAkELbEAOJZTyv8C5cuJC49iFHOxUbRZXZ5eN2SvhZzl+5gep2uHwVLdqRIxFDTHbLWnmtHxPeU7IRA9u86q3wV1N0pD7kreNN7BWKY3/tI33hY2/XVVFy0MN5sutPn+lVK66MqAHqtode5xqqz9Z8LmS7LlqokQkAytcGd6Xqsx99NTk8kk3bnk9HWsAvDO8tRZroeseKeRNmbhGvCNUxPSB6bpYBJLvQtjA9ZVv6sNm0E+SuiXKizZkBGO5AH50pDoy0+MCGoOhwwXeY5+1kZAOzkMI="
+
+setup_repo_no_add () {
+    REPONAME=${1:-test}
+    if [ x${USE_COLLECTIONS_IN_SERVER-} == xyes ] ; then
+        COLLECTION_ID=${2:-org.test.Collection.${REPONAME}}
+    else
+        COLLECTION_ID=
+    fi
+
+    GPGARGS="${GPGARGS:-${FL_GPGARGS}}" . $(dirname $0)/make-test-runtime.sh ${REPONAME} org.test.Platform "${COLLECTION_ID}" bash ls cat echo readlink > /dev/null
+    GPGARGS="${GPGARGS:-${FL_GPGARGS}}" . $(dirname $0)/make-test-app.sh ${REPONAME} "${COLLECTION_ID}" > /dev/null
+    update_repo $REPONAME "${COLLECTION_ID}"
+    if [ $REPONAME == "test" ]; then
+        $(dirname $0)/test-webserver.sh repos
+        FLATPAK_HTTP_PID=$(cat httpd-pid)
+        mv httpd-port httpd-port-main
+    fi
+}
 
 setup_repo () {
-    GPGARGS="$FL_GPGARGS" . $(dirname $0)/make-test-runtime.sh org.test.Platform bash ls cat echo readlink > /dev/null
-    GPGARGS="$FL_GPGARGS" . $(dirname $0)/make-test-app.sh > /dev/null
-    update_repo
-    ostree trivial-httpd --autoexit --daemonize -p httpd-port repos
-    port=$(cat httpd-port)
-    flatpak remote-add ${U} --gpg-import=${FL_GPG_HOMEDIR}/pubring.gpg test-repo "http://127.0.0.1:${port}/test"
+    REPONAME=${1:-test}
+    COLLECTION_ID=${2:-org.test.Collection.${REPONAME}}
+
+    setup_repo_no_add "$@"
+
+    port=$(cat httpd-port-main)
+    if [ x${GPGPUBKEY:-${FL_GPG_HOMEDIR}/pubring.gpg} != x ]; then
+        import_args=--gpg-import=${GPGPUBKEY:-${FL_GPG_HOMEDIR}/pubring.gpg}
+    else
+        import_args=
+    fi
+    if [ x${USE_COLLECTIONS_IN_CLIENT-} == xyes ] ; then
+        collection_args=--collection-id=${COLLECTION_ID}
+    else
+        collection_args=
+    fi
+
+    flatpak remote-add ${U} ${collection_args} ${import_args} ${REPONAME}-repo "http://127.0.0.1:${port}/$REPONAME"
 }
 
 update_repo () {
-    ${FLATPAK} build-update-repo $FL_GPGARGS ${UPDATE_REPO_ARGS-} repos/test
+    REPONAME=${1:-test}
+    COLLECTION_ID=${2:-org.test.Collection.${REPONAME}}
+
+    if [ x${USE_COLLECTIONS_IN_SERVER-} == xyes ] ; then
+        collection_args=--collection-id=${COLLECTION_ID}
+    else
+        collection_args=
+    fi
+
+    ${FLATPAK} build-update-repo ${collection_args} ${GPGARGS:-${FL_GPGARGS}} ${UPDATE_REPO_ARGS-} repos/${REPONAME}
 }
 
 make_updated_app () {
-    GPGARGS="$FL_GPGARGS" . $(dirname $0)/make-test-app.sh ${1:-UPDATED} > /dev/null
-    update_repo
+    REPONAME=${1:-test}
+    if [ x${USE_COLLECTIONS_IN_SERVER-} == xyes ] ; then
+        COLLECTION_ID=${2:-org.test.Collection.${REPONAME}}
+    else
+        COLLECTION_ID=""
+    fi
+
+    GPGARGS="${GPGARGS:-${FL_GPGARGS}}" . $(dirname $0)/make-test-app.sh ${REPONAME} "${COLLECTION_ID}" ${3:-UPDATED} > /dev/null
+    update_repo $REPONAME "${COLLECTION_ID}"
 }
 
 setup_sdk_repo () {
-    GPGARGS="$FL_GPGARGS" . $(dirname $0)/make-test-runtime.sh org.test.Sdk bash ls cat echo readlink make mkdir cp touch > /dev/null
-    update_repo
+    REPONAME=${1:-test}
+    if [ x${USE_COLLECTIONS_IN_SERVER-} == xyes ] ; then
+        COLLECTION_ID=${2:-org.test.Collection.${REPONAME}}
+    else
+        COLLECTION_ID=""
+    fi
+
+    GPGARGS="${GPGARGS:-${FL_GPGARGS}}" . $(dirname $0)/make-test-runtime.sh ${REPONAME} org.test.Sdk "${COLLECTION_ID}" bash ls cat echo readlink make mkdir cp touch > /dev/null
+    update_repo $REPONAME "${COLLECTION_ID}"
 }
 
 setup_python2_repo () {
-    GPGARGS="$FL_GPGARGS" . $(dirname $0)/make-test-runtime.sh org.test.PythonPlatform bash python2 ls cat echo readlink > /dev/null
-    GPGARGS="$FL_GPGARGS" . $(dirname $0)/make-test-runtime.sh org.test.PythonSdk python2 bash ls cat echo readlink make mkdir cp touch > /dev/null
-    update_repo
+    REPONAME=${1:-test}
+    if [ x${USE_COLLECTIONS_IN_SERVER-} == xyes ] ; then
+        COLLECTION_ID=${2:-org.test.Collection.${REPONAME}}
+    else
+        COLLECTION_ID=""
+    fi
+
+    GPGARGS="${GPGARGS:-${FL_GPGARGS}}" . $(dirname $0)/make-test-runtime.sh ${REPONAME} org.test.PythonPlatform "${COLLECTION_ID}" bash python2 ls cat echo rm readlink > /dev/null
+    GPGARGS="${GPGARGS:-${FL_GPGARGS}}" . $(dirname $0)/make-test-runtime.sh ${REPONAME} org.test.PythonSdk "${COLLECTION_ID}" python2 bash ls cat echo rm readlink make mkdir cp touch > /dev/null
+    update_repo $REPONAME "${COLLECTION_ID}"
 }
 
 install_repo () {
-    ${FLATPAK} ${U} install test-repo org.test.Platform master
-    ${FLATPAK} ${U} install test-repo org.test.Hello master
+    REPONAME=${1:-test}
+    ${FLATPAK} ${U} install ${REPONAME}-repo org.test.Platform master
+    ${FLATPAK} ${U} install ${REPONAME}-repo org.test.Hello master
 }
 
 install_sdk_repo () {
-    ${FLATPAK} ${U} install test-repo org.test.Sdk master
+    REPONAME=${1:-test}
+    ${FLATPAK} ${U} install ${REPONAME}-repo org.test.Sdk master
 }
 
 install_python2_repo () {
-    ${FLATPAK} ${U} install test-repo org.test.PythonPlatform master
-    ${FLATPAK} ${U} install test-repo org.test.PythonSdk master
+    REPONAME=${1:-test}
+    ${FLATPAK} ${U} install ${REPONAME}-repo org.test.PythonPlatform master
+    ${FLATPAK} ${U} install ${REPONAME}-repo org.test.PythonSdk master
 }
 
 run () {
@@ -240,7 +321,8 @@ skip_without_bwrap () {
     if [ -z "${FLATPAK_BWRAP:-}" ]; then
         # running installed-tests: assume we know what we're doing
         :
-    elif ! "$FLATPAK_BWRAP" --ro-bind / / /bin/true > bwrap-result 2>&1; then
+    elif ! "$FLATPAK_BWRAP" --unshare-ipc --unshare-net --unshare-pid \
+            --ro-bind / / /bin/true > bwrap-result 2>&1; then
         sed -e 's/^/# /' < bwrap-result
         echo "1..0 # SKIP Cannot run bwrap"
         exit 0
@@ -250,6 +332,13 @@ skip_without_bwrap () {
 skip_without_python2 () {
     if ! test -f /usr/bin/python2 || ! /usr/bin/python2 -c "import sys; sys.exit(0 if sys.version_info >= (2, 7) else 1)" ; then
         echo "1..0 # SKIP this test requires /usr/bin/python2 (2.7) support"
+        exit 0
+    fi
+}
+
+skip_without_p2p () {
+    if ! ${FLATPAK} remote-add --help | grep -q -e '--collection-id'; then
+        echo "1..0 # SKIP this test requires peer to peer support (--enable-p2p)"
         exit 0
     fi
 }
@@ -266,9 +355,13 @@ if ! /bin/kill -0 "$DBUS_SESSION_BUS_PID"; then
 fi
 
 cleanup () {
-    /bin/kill $DBUS_SESSION_BUS_PID
+    /bin/kill $DBUS_SESSION_BUS_PID ${FLATPAK_HTTP_PID:-}
     gpg-connect-agent --homedir "${FL_GPG_HOMEDIR}" killagent /bye || true
     fusermount -u $XDG_RUNTIME_DIR/doc || :
-    rm -rf $TEST_DATA_DIR
+    if test -n "${TEST_SKIP_CLEANUP:-}"; then
+        echo "Skipping cleanup of ${TEST_DATA_DIR}"
+    else
+        rm -rf $TEST_DATA_DIR
+    fi
 }
 trap cleanup EXIT

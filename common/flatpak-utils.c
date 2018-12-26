@@ -33,16 +33,20 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
+#include <unistd.h>
 #include <fcntl.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
+#include <sys/ioctl.h>
 
 #include <glib.h>
 #include "libglnx/libglnx.h"
 #include <libsoup/soup.h>
 #include <gio/gunixoutputstream.h>
+#include <gio/gunixinputstream.h>
 
 /* This is also here so the common code can report these errors to the lib */
 static const GDBusErrorEntry flatpak_error_entries[] = {
@@ -50,9 +54,8 @@ static const GDBusErrorEntry flatpak_error_entries[] = {
   {FLATPAK_ERROR_NOT_INSTALLED,         "org.freedesktop.Flatpak.Error.NotInstalled"},
 };
 
-
-GLNX_DEFINE_CLEANUP_FUNCTION (void *, flatpak_local_free_read_archive, archive_read_free)
-#define free_read_archive __attribute__((cleanup (flatpak_local_free_read_archive)))
+typedef struct archive FlatpakAutoArchiveRead;
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(FlatpakAutoArchiveRead, archive_read_free)
 
 static void
 propagate_libarchive_error (GError      **error,
@@ -122,12 +125,17 @@ gboolean
 flatpak_splice_update_checksum (GOutputStream  *out,
                                 GInputStream   *in,
                                 GChecksum      *checksum,
+                                FlatpakLoadUriProgress progress,
+                                gpointer        progress_data,
                                 GCancellable   *cancellable,
                                 GError        **error)
 {
   gsize bytes_read, bytes_written;
   char buf[32*1024];
+  guint64 downloaded_bytes = 0;
+  gint64 progress_start;
 
+  progress_start = g_get_monotonic_time ();
   do
     {
       if (!g_input_stream_read_all (in, buf, sizeof buf, &bytes_read, cancellable, error))
@@ -136,8 +144,20 @@ flatpak_splice_update_checksum (GOutputStream  *out,
       if (!flatpak_write_update_checksum (out, buf, bytes_read, &bytes_written, checksum,
                                           cancellable, error))
         return FALSE;
+
+      downloaded_bytes += bytes_read;
+
+      if (progress &&
+          g_get_monotonic_time () - progress_start >  5 * 1000000)
+        {
+          progress (downloaded_bytes, progress_data);
+          progress_start = g_get_monotonic_time ();
+        }
     }
   while (bytes_read > 0);
+
+  if (progress)
+    progress (downloaded_bytes, progress_data);
 
   return TRUE;
 }
@@ -284,24 +304,7 @@ flatpak_path_match_prefix (const char *pattern,
   return NULL; /* Should not be reached */
 }
 
-gboolean
-flatpak_fail (GError **error, const char *format, ...)
-{
-  g_autofree char *message = NULL;
-  va_list args;
-
-  va_start (args, format);
-  message = g_strdup_vprintf (format, args);
-  va_end (args);
-
-  g_set_error_literal (error,
-                       G_IO_ERROR, G_IO_ERROR_FAILED,
-                       message);
-
-  return FALSE;
-}
-
-const char *
+static const char *
 flatpak_get_kernel_arch (void)
 {
   static struct utsname buf;
@@ -382,6 +385,22 @@ flatpak_get_arch (void)
 #else
   return flatpak_get_kernel_arch ();
 #endif
+}
+
+gboolean
+flatpak_is_linux32_arch (const char *arch)
+{
+  const char *kernel_arch = flatpak_get_kernel_arch ();
+
+  if (strcmp (kernel_arch, "x86_64") == 0 &&
+      strcmp (arch, "i386") == 0)
+    return TRUE;
+
+  if (strcmp (kernel_arch, "aarch64") == 0 &&
+      strcmp (arch, "arm") == 0)
+    return TRUE;
+
+  return FALSE;
 }
 
 /* Get all compatible arches for this host in order of priority */
@@ -488,6 +507,12 @@ flatpak_is_in_sandbox (void)
   return in_sandbox == 1;
 }
 
+gboolean
+flatpak_fancy_output (void)
+{
+        return isatty (STDOUT_FILENO);
+}
+
 const char *
 flatpak_get_bwrap (void)
 {
@@ -499,7 +524,7 @@ flatpak_get_bwrap (void)
 }
 
 gboolean
-flatpak_unbreak_hardlink (GFile *file, GError **error)
+flatpak_break_hardlink (GFile *file, GError **error)
 {
   g_autofree char *path = g_file_get_path (file);
   struct stat st_buf;
@@ -509,7 +534,7 @@ flatpak_unbreak_hardlink (GFile *file, GError **error)
       g_autoptr(GFile) dir = g_file_get_parent (file);
       g_autoptr(GFile) tmp = NULL;
 
-      tmp = flatpak_file_new_tmp_in (dir, ".eustripXXXXXX", error);
+      tmp = flatpak_file_new_tmp_in (dir, ".breaklinkXXXXXX", error);
       if (tmp == NULL)
         return FALSE;
 
@@ -732,7 +757,8 @@ is_valid_branch_character (gint c)
     (c == '.');
 }
 
-/** flatpak_is_valid_branch:
+/**
+ * flatpak_is_valid_branch:
  * @string: The string to check
  * @error: return location for an error
  *
@@ -794,6 +820,35 @@ flatpak_is_valid_branch (const char *string,
 
 out:
   return ret;
+}
+
+/* Dashes are only valid in the last part of the app id, so
+   we replace them with underscore so we can suffix the id */
+char *
+flatpak_make_valid_id_prefix (const char *orig_id)
+{
+  char *id, *t;
+
+  id = g_strdup (orig_id);
+  t = id;
+  while (*t != 0 && *t != '/')
+    {
+      if (*t == '-')
+        *t = '_';
+
+      t++;
+    }
+
+  return id;
+}
+
+gboolean
+flatpak_id_has_subref_suffix (const char *id)
+{
+  return
+    g_str_has_suffix (id, ".Locale") ||
+    g_str_has_suffix (id, ".Debug") ||
+    g_str_has_suffix (id, ".Sources");
 }
 
 char **
@@ -874,7 +929,7 @@ flatpak_kinds_from_bools (gboolean app, gboolean runtime)
   return kinds;
 }
 
-gboolean
+static gboolean
 _flatpak_split_partial_ref_arg (const char   *partial_ref,
                                 gboolean      validate,
                                 FlatpakKinds  default_kinds,
@@ -1121,13 +1176,13 @@ flatpak_list_unmaintained_refs (const char   *name_prefix,
                                 GError      **error)
 {
   gchar **ret = NULL;
-
   g_autoptr(GPtrArray) names = NULL;
   g_autoptr(GHashTable) hash = NULL;
   g_autoptr(FlatpakDir) user_dir = NULL;
-  g_autoptr(GError) my_error = NULL;
   const char *key;
   GHashTableIter iter;
+  g_autoptr(GPtrArray) system_dirs = NULL;
+  int i;
 
   hash = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
 
@@ -1135,30 +1190,21 @@ flatpak_list_unmaintained_refs (const char   *name_prefix,
 
   if (!flatpak_dir_collect_unmaintained_refs (user_dir, name_prefix,
                                               branch, arch, hash, cancellable,
-                                              &my_error))
+                                              error))
+    return NULL;
+
+  system_dirs = flatpak_dir_get_system_list (cancellable, error);
+  if (system_dirs == NULL)
+    return NULL;
+
+  for (i = 0; i < system_dirs->len; i++)
     {
-      g_autoptr(GPtrArray) system_dirs = NULL;
-      int i;
+      FlatpakDir *system_dir = g_ptr_array_index (system_dirs, i);
 
-      system_dirs = flatpak_dir_get_system_list (cancellable, error);
-      if (system_dirs == NULL)
-        goto out;
-
-      for (i = 0; i < system_dirs->len; i++)
-        {
-          FlatpakDir *system_dir = g_ptr_array_index (system_dirs, i);
-
-          g_clear_error (&my_error);
-          if (flatpak_dir_collect_unmaintained_refs (system_dir, name_prefix,
-                                                     branch, arch, hash, cancellable,
-                                                     &my_error))
-            {
-              /* Reference found in at least one of the system installations */
-              break;
-            }
-
-          goto out;
-        }
+      if (!flatpak_dir_collect_unmaintained_refs (system_dir, name_prefix,
+                                                  branch, arch, hash, cancellable,
+                                                  error))
+        return NULL;
     }
 
   names = g_ptr_array_new ();
@@ -1172,10 +1218,6 @@ flatpak_list_unmaintained_refs (const char   *name_prefix,
   ret = (char **) g_ptr_array_free (names, FALSE);
   names = NULL;
 
-  if (ret == NULL)
-    g_propagate_error (error, g_steal_pointer (&my_error));
-
-out:
   return ret;
 }
 
@@ -1272,6 +1314,41 @@ flatpak_find_unmaintained_extension_dir_if_exists (const char   *name,
     return NULL;
 
   return g_steal_pointer(&extension_dir);
+}
+
+char *
+flatpak_find_current_ref (const char *app_id,
+                          GCancellable *cancellable,
+                          GError      **error)
+{
+  g_autofree char *current_ref = NULL;
+  g_autoptr(FlatpakDir) user_dir = flatpak_dir_get_user ();
+  int i;
+
+  current_ref = flatpak_dir_current_ref (user_dir, app_id, NULL);
+  if (current_ref == NULL)
+    {
+      g_autoptr(GPtrArray) system_dirs = NULL;
+
+      system_dirs = flatpak_dir_get_system_list (cancellable, error);
+      if (system_dirs == NULL)
+        return FALSE;
+
+      for (i = 0; i < system_dirs->len; i++)
+        {
+          FlatpakDir *dir = g_ptr_array_index (system_dirs, i);
+          current_ref = flatpak_dir_current_ref (dir, app_id, cancellable);
+          if (current_ref != NULL)
+            break;
+        }
+    }
+
+  if (current_ref)
+    return g_steal_pointer (&current_ref);
+
+  g_set_error (error, FLATPAK_ERROR, FLATPAK_ERROR_NOT_INSTALLED,
+               _("%s not installed"), app_id);
+  return NULL;
 }
 
 FlatpakDeploy *
@@ -1540,109 +1617,6 @@ flatpak_mkstempat (int    dir_fd,
   return -1;
 }
 
-struct FlatpakTablePrinter
-{
-  GPtrArray *rows;
-  GPtrArray *current;
-  int        n_columns;
-};
-
-FlatpakTablePrinter *
-flatpak_table_printer_new (void)
-{
-  FlatpakTablePrinter *printer = g_new0 (FlatpakTablePrinter, 1);
-
-  printer->rows = g_ptr_array_new_with_free_func ((GDestroyNotify) g_strfreev);
-  printer->current = g_ptr_array_new_with_free_func (g_free);
-
-  return printer;
-}
-
-void
-flatpak_table_printer_free (FlatpakTablePrinter *printer)
-{
-  g_ptr_array_free (printer->rows, TRUE);
-  g_ptr_array_free (printer->current, TRUE);
-  g_free (printer);
-}
-
-void
-flatpak_table_printer_add_column (FlatpakTablePrinter *printer,
-                                  const char          *text)
-{
-  g_ptr_array_add (printer->current, text ? g_strdup (text) : g_strdup (""));
-}
-
-void
-flatpak_table_printer_add_column_len (FlatpakTablePrinter *printer,
-                                      const char          *text,
-                                      gsize len)
-{
-  g_ptr_array_add (printer->current, text ? g_strndup (text, len) : g_strdup (""));
-}
-
-void
-flatpak_table_printer_append_with_comma (FlatpakTablePrinter *printer,
-                                         const char          *text)
-{
-  char *old, *new;
-
-  g_assert (printer->current->len > 0);
-
-  old = g_ptr_array_index (printer->current, printer->current->len - 1);
-
-  if (old[0] != 0)
-    new = g_strconcat (old, ",", text, NULL);
-  else
-    new = g_strdup (text);
-
-  g_ptr_array_index (printer->current, printer->current->len - 1) = new;
-  g_free (old);
-}
-
-
-void
-flatpak_table_printer_finish_row (FlatpakTablePrinter *printer)
-{
-  if (printer->current->len == 0)
-    return; /* Ignore empty rows */
-
-  printer->n_columns = MAX (printer->n_columns, printer->current->len);
-  g_ptr_array_add (printer->current, NULL);
-  g_ptr_array_add (printer->rows,
-                   g_ptr_array_free (printer->current, FALSE));
-  printer->current = g_ptr_array_new_with_free_func (g_free);
-}
-
-void
-flatpak_table_printer_print (FlatpakTablePrinter *printer)
-{
-  g_autofree int *widths = NULL;
-  int i, j;
-
-  if (printer->current->len != 0)
-    flatpak_table_printer_finish_row (printer);
-
-  widths = g_new0 (int, printer->n_columns);
-
-  for (i = 0; i < printer->rows->len; i++)
-    {
-      char **row = g_ptr_array_index (printer->rows, i);
-
-      for (j = 0; row[j] != NULL; j++)
-        widths[j] = MAX (widths[j], strlen (row[j]));
-    }
-
-  for (i = 0; i < printer->rows->len; i++)
-    {
-      char **row = g_ptr_array_index (printer->rows, i);
-
-      for (j = 0; row[j] != NULL; j++)
-        g_print ("%s%-*s", (j == 0) ? "" : " ", widths[j], row[j]);
-      g_print ("\n");
-    }
-}
-
 
 static GHashTable *app_ids;
 
@@ -1687,7 +1661,7 @@ parse_app_id_from_fileinfo (int pid)
   if (root_fd == -1)
     {
       /* Not able to open the root dir shouldn't happen. Probably the app died and
-         we're failing due to /proc/$pid not existing. In that case fail instead
+         *we're failing due to /proc/$pid not existing. In that case fail instead
          of treating this as privileged. */
       g_debug ("Unable to open %s", root_path);
       return NULL;
@@ -1701,7 +1675,8 @@ parse_app_id_from_fileinfo (int pid)
       if (errno == ENOENT)
         {
           /* No file => on the host */
-          g_key_file_set_string (metadata, "Application", "name", "");
+          g_key_file_set_string (metadata, FLATPAK_METADATA_GROUP_APPLICATION,
+                                 FLATPAK_METADATA_KEY_NAME, "");
           return g_steal_pointer (&metadata);
         }
 
@@ -1914,6 +1889,55 @@ spawn_exit_cb (GObject      *obj,
   spawn_data_exit (data);
 }
 
+static gboolean
+needs_quoting (const char *arg)
+{
+  while (*arg != 0)
+    {
+      char c = *arg;
+      if (!g_ascii_isalnum (c) &&
+          !(c == '-' || c == '/' || c == '~' ||
+            c == ':' || c == '.' || c == '_' ||
+            c == '='))
+        return TRUE;
+      arg++;
+    }
+  return FALSE;
+}
+
+char *
+flatpak_quote_argv (const char *argv[])
+{
+  GString *res = g_string_new ("");
+  int i;
+
+  for (i = 0; argv[i] != NULL; i++)
+    {
+      if (i != 0)
+        g_string_append_c (res, ' ');
+
+      if (needs_quoting (argv[i]))
+        {
+          g_autofree char *quoted = g_shell_quote (argv[i]);
+          g_string_append (res, quoted);
+        }
+      else
+        g_string_append (res, argv[i]);
+    }
+
+  return g_string_free (res, FALSE);
+}
+
+/* This is useful, because it handles escaped characters in uris, and ? arguments at the end of the uri */
+gboolean
+flatpak_file_arg_has_suffix (const char *arg, const char *suffix)
+{
+  g_autoptr(GFile) file = g_file_new_for_commandline_arg (arg);
+  g_autofree char *basename = g_file_get_basename (file);
+
+  return g_str_has_suffix (basename, suffix);
+}
+
 gboolean
 flatpak_spawn (GFile       *dir,
                char       **output,
@@ -1931,7 +1955,7 @@ flatpak_spawn (GFile       *dir,
     g_ptr_array_add (args, (gchar *) arg);
   g_ptr_array_add (args, NULL);
 
-  res = flatpak_spawnv (dir, output, error, (const gchar * const *) args->pdata);
+  res = flatpak_spawnv (dir, output, 0, error, (const gchar * const *) args->pdata);
 
   g_ptr_array_free (args, TRUE);
 
@@ -1941,6 +1965,7 @@ flatpak_spawn (GFile       *dir,
 gboolean
 flatpak_spawnv (GFile                *dir,
                 char                **output,
+                GSubprocessFlags      flags,
                 GError              **error,
                 const gchar * const  *argv)
 {
@@ -1955,7 +1980,9 @@ flatpak_spawnv (GFile                *dir,
   launcher = g_subprocess_launcher_new (0);
 
   if (output)
-    g_subprocess_launcher_set_flags (launcher, G_SUBPROCESS_FLAGS_STDOUT_PIPE);
+    flags |= G_SUBPROCESS_FLAGS_STDOUT_PIPE;
+
+  g_subprocess_launcher_set_flags (launcher, flags);
 
   if (dir)
     {
@@ -1963,8 +1990,8 @@ flatpak_spawnv (GFile                *dir,
       g_subprocess_launcher_set_cwd (launcher, path);
     }
 
-  commandline = g_strjoinv (" ", (gchar **) argv);
-  g_debug ("Running '%s'", commandline);
+  commandline = flatpak_quote_argv ((const char **)argv);
+  g_debug ("Running: %s", commandline);
 
   subp = g_subprocess_launcher_spawnv (launcher, argv, error);
 
@@ -2018,13 +2045,42 @@ flatpak_spawnv (GFile                *dir,
   return TRUE;
 }
 
+GFile *
+flatpak_build_file_va (GFile *base,
+                       va_list args)
+{
+  g_autoptr(GFile) res = g_object_ref (base);
+  const gchar *arg;
+
+  while ((arg = va_arg (args, const gchar *)))
+    {
+      GFile *child = g_file_resolve_relative_path (res, arg);
+      g_set_object (&res, child);
+    }
+
+  return g_steal_pointer (&res);
+}
+
+GFile *
+flatpak_build_file (GFile *base, ...)
+{
+  GFile *res;
+  va_list args;
+
+  va_start (args, base);
+  res = flatpak_build_file_va (base, args);
+  va_end (args);
+
+  return res;
+}
+
 const char *
 flatpak_file_get_path_cached (GFile *file)
 {
   const char *path;
   static GQuark _file_path_quark = 0;
 
-  if (G_UNLIKELY (_file_path_quark) == 0)
+  if (G_UNLIKELY (_file_path_quark == 0))
     _file_path_quark = g_quark_from_static_string ("flatpak-file-path");
 
   do
@@ -2080,44 +2136,6 @@ flatpak_openat_noatime (int            dfd,
       *ret_fd = fd;
       return TRUE;
     }
-}
-
-#define COPY_BUFFER_SIZE (16*1024)
-gboolean
-flatpak_copy_bytes (int fdf,
-                    int fdt,
-                    GError **error)
-{
-  char buf[COPY_BUFFER_SIZE];
-  int r;
-
-  g_return_val_if_fail (fdf >= 0, FALSE);
-  g_return_val_if_fail (fdt >= 0, FALSE);
-
-  for (;;)
-    {
-      size_t m = COPY_BUFFER_SIZE;
-      ssize_t n;
-
-      n = read (fdf, buf, m);
-      if (n < 0)
-        {
-          glnx_set_error_from_errno (error);
-          return FALSE;
-        }
-      if (n == 0) /* EOF */
-        break;
-
-      r = glnx_loop_write (fdt, buf, (size_t) n);
-      if (r < 0)
-        {
-          errno = r;
-          glnx_set_error_from_errno (error);
-          return FALSE;
-        }
-    }
-
-  return TRUE;
 }
 
 gboolean
@@ -2265,10 +2283,11 @@ flatpak_zero_mtime (int parent_dfd,
   if (S_ISDIR (stbuf.st_mode))
     {
       g_auto(GLnxDirFdIterator) dfd_iter = { 0, };
+      gboolean inited;
 
-      glnx_dirfd_iterator_init_at (parent_dfd, rel_path, FALSE, &dfd_iter, NULL);
+      inited = glnx_dirfd_iterator_init_at (parent_dfd, rel_path, FALSE, &dfd_iter, NULL);
 
-      while (TRUE)
+      while (inited)
         {
           struct dirent *dent;
 
@@ -2503,13 +2522,15 @@ flatpak_variant_bsearch_str (GVariant   *array,
   while (imax >= imin)
     {
       g_autoptr(GVariant) child = NULL;
+      g_autoptr(GVariant) cur_v = NULL;
       const char *cur;
       int cmp;
 
       imid = (imin + imax) / 2;
 
       child = g_variant_get_child_value (array, imid);
-      g_variant_get_child (child, 0, "&s", &cur, NULL);
+      cur_v = g_variant_get_child_value (child, 0);
+      cur = g_variant_get_data (cur_v);
 
       cmp = strcmp (cur, str);
       if (cmp < 0)
@@ -2533,42 +2554,94 @@ flatpak_variant_bsearch_str (GVariant   *array,
   return FALSE;
 }
 
-/* This matches all refs that have ref, followed by '.'  as prefix */
-char **
-flatpak_summary_match_subrefs (GVariant *summary, const char *ref)
+/* Find the list of refs which belong to the given @collection_id in @summary.
+ * If @collection_id is %NULL, the main refs list from the summary will be
+ * returned. If @collection_id doesn’t match any collection IDs in the summary
+ * file, %NULL will be returned. */
+static GVariant *
+summary_find_refs_list (GVariant   *summary,
+                        const char *collection_id)
 {
-  g_autoptr(GVariant) refs = g_variant_get_child_value (summary, 0);
+  g_autoptr(GVariant) refs = NULL;
+  g_autoptr(GVariant) metadata = g_variant_get_child_value (summary, 1);
+  const char *summary_collection_id;
+
+  if (!g_variant_lookup (metadata, "ostree.summary.collection-id", "&s", &summary_collection_id))
+    summary_collection_id = NULL;
+
+  if (collection_id == NULL || g_strcmp0 (collection_id, summary_collection_id) == 0)
+    {
+      refs = g_variant_get_child_value (summary, 0);
+    }
+  else if (collection_id != NULL)
+    {
+      g_autoptr(GVariant) collection_map = NULL;
+
+      collection_map = g_variant_lookup_value (metadata, "ostree.summary.collection-map",
+                                               G_VARIANT_TYPE ("a{sa(s(taya{sv}))}"));
+      if (collection_map != NULL)
+        refs = g_variant_lookup_value (collection_map, collection_id, G_VARIANT_TYPE ("a(s(taya{sv}))"));
+    }
+
+  return g_steal_pointer (&refs);
+}
+
+/* This matches all refs from @collection_id that have ref, followed by '.'  as prefix */
+char **
+flatpak_summary_match_subrefs (GVariant   *summary,
+                               const char *collection_id,
+                               const char *ref)
+{
+  g_autoptr(GVariant) refs = NULL;
   GPtrArray *res = g_ptr_array_new ();
   gsize n, i;
   g_auto(GStrv) parts = NULL;
   g_autofree char *parts_prefix = NULL;
+  g_autofree char *ref_prefix = NULL;
+  g_autofree char *ref_suffix = NULL;
 
-  parts = g_strsplit (ref, "/", 0);
-  parts_prefix = g_strconcat (parts[1], ".", NULL);
+  /* Work out which refs list to use, based on the @collection_id. */
+  refs = summary_find_refs_list (summary, collection_id);
 
-  n = g_variant_n_children (refs);
-  for (i = 0; i < n; i++)
+  if (refs != NULL)
     {
-      g_autoptr(GVariant) child = NULL;
-      g_auto(GStrv) cur_parts = NULL;
-      const char *cur;
+      /* Match against the refs. */
+      parts = g_strsplit (ref, "/", 0);
+      parts_prefix = g_strconcat (parts[1], ".", NULL);
 
-      child = g_variant_get_child_value (refs, i);
-      g_variant_get_child (child, 0, "&s", &cur, NULL);
+      ref_prefix = g_strconcat (parts[0], "/", NULL);
+      ref_suffix = g_strconcat ("/", parts[2], "/", parts[3], NULL);
 
-      cur_parts = g_strsplit (cur, "/", 0);
+      n = g_variant_n_children (refs);
+      for (i = 0; i < n; i++)
+        {
+          g_autoptr(GVariant) child = NULL;
+          g_autoptr(GVariant) cur_v = NULL;
+          const char *cur;
+          const char *id_start;
 
-      /* Must match type, arch, branch */
-      if (strcmp (parts[0], cur_parts[0]) != 0 ||
-          strcmp (parts[2], cur_parts[2]) != 0 ||
-          strcmp (parts[3], cur_parts[3]) != 0)
-        continue;
+          child = g_variant_get_child_value (refs, i);
+          cur_v = g_variant_get_child_value (child, 0);
+          cur = g_variant_get_data (cur_v);
 
-      /* But only prefix of id */
-      if (!g_str_has_prefix (cur_parts[1], parts_prefix))
-        continue;
+          /* Must match type */
+          if (!g_str_has_prefix (cur, ref_prefix))
+            continue;
 
-      g_ptr_array_add (res, g_strdup (cur));
+          /* Must match arch & branch */
+          if (!g_str_has_suffix (cur, ref_suffix))
+            continue;
+
+          id_start = strchr (cur, '/');
+          if (id_start == NULL)
+            continue;
+
+          /* But only prefix of id */
+          if (!g_str_has_prefix (id_start + 1, parts_prefix))
+            continue;
+
+          g_ptr_array_add (res, g_strdup (cur));
+        }
     }
 
   g_ptr_array_add (res, NULL);
@@ -2576,14 +2649,22 @@ flatpak_summary_match_subrefs (GVariant *summary, const char *ref)
 }
 
 gboolean
-flatpak_summary_lookup_ref (GVariant *summary, const char *ref, char **out_checksum)
+flatpak_summary_lookup_ref (GVariant    *summary,
+                            const char  *collection_id,
+                            const char  *ref,
+                            char       **out_checksum,
+                            GVariant   **out_variant)
 {
-  g_autoptr(GVariant) refs = g_variant_get_child_value (summary, 0);
+  g_autoptr(GVariant) refs = NULL;
   int pos;
   g_autoptr(GVariant) refdata = NULL;
   g_autoptr(GVariant) reftargetdata = NULL;
   guint64 commit_size;
   g_autoptr(GVariant) commit_csum_v = NULL;
+
+  refs = summary_find_refs_list (summary, collection_id);
+  if (refs == NULL)
+    return FALSE;
 
   if (!flatpak_variant_bsearch_str (refs, ref, &pos))
     return FALSE;
@@ -2597,6 +2678,9 @@ flatpak_summary_lookup_ref (GVariant *summary, const char *ref, char **out_check
 
   if (out_checksum)
     *out_checksum = ostree_checksum_from_bytes_v (commit_csum_v);
+
+  if (out_variant)
+    *out_variant = g_steal_pointer (&reftargetdata);
 
   return TRUE;
 }
@@ -2621,6 +2705,57 @@ flatpak_repo_set_title (OstreeRepo *repo,
   return TRUE;
 }
 
+gboolean
+flatpak_repo_set_redirect_url (OstreeRepo *repo,
+                               const char *redirect_url,
+                               GError    **error)
+{
+  g_autoptr(GKeyFile) config = NULL;
+
+  config = ostree_repo_copy_config (repo);
+
+  if (redirect_url)
+    g_key_file_set_string (config, "flatpak", "redirect-url", redirect_url);
+  else
+    g_key_file_remove_key (config, "flatpak", "redirect-url", NULL);
+
+  if (!ostree_repo_write_config (repo, config, error))
+    return FALSE;
+
+  return TRUE;
+}
+
+gboolean
+flatpak_repo_set_deploy_collection_id (OstreeRepo  *repo,
+                                       gboolean     deploy_collection_id,
+                                       GError     **error)
+{
+  g_autoptr(GKeyFile) config = NULL;
+
+  config = ostree_repo_copy_config (repo);
+  g_key_file_set_boolean (config, "flatpak", "deploy-collection-id", deploy_collection_id);
+  return ostree_repo_write_config (repo, config, error);
+}
+
+gboolean
+flatpak_repo_set_gpg_keys (OstreeRepo *repo,
+                           GBytes *bytes,
+                           GError    **error)
+{
+  g_autoptr(GKeyFile) config = NULL;
+  g_autofree char *value_base64 = NULL;
+
+  config = ostree_repo_copy_config (repo);
+
+  value_base64 = g_base64_encode (g_bytes_get_data (bytes, NULL), g_bytes_get_size (bytes));
+
+  g_key_file_set_string (config, "flatpak", "gpg-keys", value_base64);
+
+  if (!ostree_repo_write_config (repo, config, error))
+    return FALSE;
+
+  return TRUE;
+}
 
 gboolean
 flatpak_repo_set_default_branch (OstreeRepo *repo,
@@ -2638,6 +2773,25 @@ flatpak_repo_set_default_branch (OstreeRepo *repo,
 
   if (!ostree_repo_write_config (repo, config, error))
     return FALSE;
+
+  return TRUE;
+}
+
+gboolean
+flatpak_repo_set_collection_id (OstreeRepo  *repo,
+                                const char  *collection_id,
+                                GError     **error)
+{
+#ifdef FLATPAK_ENABLE_P2P
+  g_autoptr(GKeyFile) config = NULL;
+
+  config = ostree_repo_copy_config (repo);
+  if (!ostree_repo_set_collection_id (repo, collection_id, error))
+    return FALSE;
+
+  if (!ostree_repo_write_config (repo, config, error))
+    return FALSE;
+#endif  /* FLATPAK_ENABLE_P2P */
 
   return TRUE;
 }
@@ -2735,10 +2889,41 @@ _flatpak_repo_collect_sizes (OstreeRepo   *repo,
 
       if (download_size)
         {
+          g_autoptr(GInputStream) input = NULL;
+          GInputStream *base_input;
+          g_autoptr(GError) local_error = NULL;
+
           if (!ostree_repo_query_object_storage_size (repo,
                                                       OSTREE_OBJECT_TYPE_FILE, checksum,
-                                                      &obj_size, cancellable, error))
-            return FALSE;
+                                                      &obj_size, cancellable, &local_error))
+            {
+              int fd;
+              struct stat stbuf;
+
+              /* Ostree does not look at the staging directory when querying storage
+                 size, so may return a NOT_FOUND error here. We work around this
+                 by loading the object and walking back until we find the original
+                 fd which we can fstat(). */
+              if (!g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
+                return FALSE;
+
+              if (!ostree_repo_load_file (repo, checksum,  &input, NULL, NULL, NULL, error))
+                return FALSE;
+
+              base_input = input;
+              while (G_IS_FILTER_INPUT_STREAM (base_input))
+                base_input = g_filter_input_stream_get_base_stream (G_FILTER_INPUT_STREAM (base_input));
+
+              if (!G_IS_UNIX_INPUT_STREAM (base_input))
+                return flatpak_fail (error, "Unable to find size of commit %s, not an unix stream\n", checksum);
+
+              fd = g_unix_input_stream_get_fd (G_UNIX_INPUT_STREAM (base_input));
+
+              if (fstat (fd, &stbuf) != 0)
+                return glnx_throw_errno_prefix (error, "Can't find commit size: ");
+
+              obj_size = stbuf.st_size;
+            }
 
           *download_size += obj_size;
         }
@@ -2853,6 +3038,79 @@ commit_data_free (gpointer data)
   g_free (rev_data);
 }
 
+/* For all the refs listed in @cache_v (an xa.cache value) which exist in the
+ * @summary, insert their data into @commit_data_cache if it isn’t already there. */
+static void
+populate_commit_data_cache (GVariant   *metadata,
+                            GVariant   *summary,
+                            GHashTable *commit_data_cache  /* (element-type utf8 CommitData) */)
+{
+  g_autoptr(GVariant) cache_v = NULL;
+  g_autoptr(GVariant) cache = NULL;
+  gsize n, i;
+  const char *old_collection_id;
+
+#if FLATPAK_ENABLE_P2P
+  if (!g_variant_lookup (metadata, "ostree.summary.collection-id", "&s", &old_collection_id))
+    old_collection_id = NULL;
+#else  /* if !FLATPAK_ENABLE_P2P */
+  old_collection_id = NULL;
+#endif  /* !FLATPAK_ENABLE_P2P */
+
+  cache_v = g_variant_lookup_value (metadata, "xa.cache", NULL);
+
+  if (cache_v == NULL)
+    return;
+
+  cache = g_variant_get_child_value (cache_v, 0);
+
+  n = g_variant_n_children (cache);
+  for (i = 0; i < n; i++)
+    {
+      g_autoptr(GVariant) old_element = g_variant_get_child_value (cache, i);
+      g_autoptr(GVariant) old_ref_v = g_variant_get_child_value (old_element, 0);
+      const char *old_ref = g_variant_get_string (old_ref_v, NULL);
+      g_autofree char *old_rev = NULL;
+      g_autoptr(GVariant) old_commit_data_v = g_variant_get_child_value (old_element, 1);
+      CommitData *old_rev_data;
+
+      if (flatpak_summary_lookup_ref (summary, old_collection_id, old_ref, &old_rev, NULL))
+        {
+          guint64 old_installed_size, old_download_size;
+          g_autofree char *old_metadata = NULL;
+
+          /* See if we already have the info on this revision */
+          if (g_hash_table_lookup (commit_data_cache, old_rev))
+            continue;
+
+          g_variant_get_child (old_commit_data_v, 0, "t", &old_installed_size);
+          old_installed_size = GUINT64_FROM_BE (old_installed_size);
+          g_variant_get_child (old_commit_data_v, 1, "t", &old_download_size);
+          old_download_size = GUINT64_FROM_BE (old_download_size);
+          g_variant_get_child (old_commit_data_v, 2, "s", &old_metadata);
+
+          old_rev_data = g_new (CommitData, 1);
+          old_rev_data->installed_size = old_installed_size;
+          old_rev_data->download_size = old_download_size;
+          old_rev_data->metadata_contents = g_steal_pointer (&old_metadata);
+
+          g_hash_table_insert (commit_data_cache, g_steal_pointer (&old_rev), old_rev_data);
+        }
+    }
+}
+
+/* Update the metadata in the summary file for @repo, and then re-sign the file.
+ * If the repo has a collection ID set, additionally store the metadata on a
+ * contentless commit in a well-known branch, which is the preferred way of
+ * broadcasting per-repo metadata (putting it in the summary file is deprecated,
+ * but kept for backwards compatibility).
+ *
+ * Note that there are two keys for the collection ID: collection-id, and
+ * xa.collection-id. If a client does not currently have a collection ID configured
+ * for this remote, it will *only* update its configuration from xa.collection-id.
+ * This allows phased deployment of collection-based repositories. Clients will
+ * only update their configuration from an unset to a set collection ID once
+ * (otherwise the security properties of collection IDs are broken). */
 gboolean
 flatpak_repo_update (OstreeRepo   *repo,
                      const char  **gpg_key_ids,
@@ -2864,7 +3122,9 @@ flatpak_repo_update (OstreeRepo   *repo,
   GVariantBuilder ref_data_builder;
   GKeyFile *config;
   g_autofree char *title = NULL;
+  g_autofree char *redirect_url = NULL;
   g_autofree char *default_branch = NULL;
+  g_autofree char *gpg_keys = NULL;
   g_autoptr(GVariant) old_summary = NULL;
   g_autoptr(GVariant) new_summary = NULL;
   g_autoptr(GHashTable) refs = NULL;
@@ -2873,6 +3133,10 @@ flatpak_repo_update (OstreeRepo   *repo,
   g_autoptr(GList) ordered_keys = NULL;
   GList *l = NULL;
   g_autoptr(GHashTable) commit_data_cache = NULL;
+  const char *collection_id;
+  g_autofree char *old_ostree_metadata_checksum = NULL;
+  g_autoptr(GVariant) old_ostree_metadata_v = NULL;
+  gboolean deploy_collection_id = FALSE;
 
   g_variant_builder_init (&builder, G_VARIANT_TYPE_VARDICT);
 
@@ -2882,15 +3146,47 @@ flatpak_repo_update (OstreeRepo   *repo,
     {
       title = g_key_file_get_string (config, "flatpak", "title", NULL);
       default_branch = g_key_file_get_string (config, "flatpak", "default-branch", NULL);
+      gpg_keys = g_key_file_get_string (config, "flatpak", "gpg-keys", NULL);
+      redirect_url = g_key_file_get_string (config, "flatpak", "redirect-url", NULL);
+      deploy_collection_id = g_key_file_get_boolean (config, "flatpak", "deploy-collection-id", NULL);
     }
+
+#ifdef FLATPAK_ENABLE_P2P
+  collection_id = ostree_repo_get_collection_id (repo);
+#else  /* if !FLATPAK_ENABLE_P2P */
+  collection_id = NULL;
+#endif  /* FLATPAK_ENABLE_P2P */
 
   if (title)
     g_variant_builder_add (&builder, "{sv}", "xa.title",
                            g_variant_new_string (title));
 
+  if (redirect_url)
+    g_variant_builder_add (&builder, "{sv}", "xa.redirect-url",
+                           g_variant_new_string (redirect_url));
+
   if (default_branch)
     g_variant_builder_add (&builder, "{sv}", "xa.default-branch",
                            g_variant_new_string (default_branch));
+
+  if (deploy_collection_id && collection_id != NULL)
+    g_variant_builder_add (&builder, "{sv}", "xa.collection-id",
+                           g_variant_new_string (collection_id));
+  else if (deploy_collection_id)
+    g_debug ("Ignoring deploy-collection-id=true because no collection ID is set.");
+
+  if (gpg_keys)
+    {
+      guchar *decoded;
+      gsize decoded_len;
+
+      gpg_keys = g_strstrip (gpg_keys);
+      decoded = g_base64_decode (gpg_keys, &decoded_len);
+
+      g_variant_builder_add (&builder, "{sv}", "xa.gpg-keys",
+                             g_variant_new_from_data (G_VARIANT_TYPE ("ay"), decoded, decoded_len,
+                                                      TRUE, (GDestroyNotify)g_free, decoded));
+    }
 
   g_variant_builder_init (&ref_data_builder, G_VARIANT_TYPE ("a{s(tts)}"));
 
@@ -2921,50 +3217,26 @@ flatpak_repo_update (OstreeRepo   *repo,
                                              g_free, commit_data_free);
 
   old_summary = flatpak_repo_load_summary (repo, NULL);
-  if (old_summary != NULL)
+
+#ifdef FLATPAK_ENABLE_P2P
+  if (!ostree_repo_resolve_rev (repo, OSTREE_REPO_METADATA_REF,
+                                TRUE, &old_ostree_metadata_checksum, error))
+    return FALSE;
+#endif  /* FLATPAK_ENABLE_P2P */
+
+  if (old_summary != NULL &&
+      old_ostree_metadata_checksum != NULL &&
+      ostree_repo_load_commit (repo, old_ostree_metadata_checksum, &old_ostree_metadata_v, NULL, NULL))
+    {
+      g_autoptr(GVariant) metadata = g_variant_get_child_value (old_ostree_metadata_v, 0);
+
+      populate_commit_data_cache (metadata, old_summary, commit_data_cache);
+    }
+  else if (old_summary != NULL)
     {
       g_autoptr(GVariant) extensions = g_variant_get_child_value (old_summary, 1);
-      g_autoptr(GVariant) cache_v = g_variant_lookup_value (extensions, "xa.cache", NULL);
-      g_autoptr(GVariant) cache = NULL;
-      if (cache_v != NULL)
-        {
-          cache = g_variant_get_child_value (cache_v, 0);
-          gsize n, i;
 
-          n = g_variant_n_children (cache);
-          for (i = 0; i < n; i++)
-            {
-              g_autoptr(GVariant) old_element = g_variant_get_child_value (cache, i);
-              g_autoptr(GVariant) old_ref_v = g_variant_get_child_value (old_element, 0);
-              const char *old_ref = g_variant_get_string (old_ref_v, NULL);
-              g_autofree char *old_rev = NULL;
-              g_autoptr(GVariant) old_commit_data_v = g_variant_get_child_value (old_element, 1);
-              CommitData *old_rev_data;
-
-              if (flatpak_summary_lookup_ref (old_summary, old_ref, &old_rev))
-                {
-                  guint64 old_installed_size, old_download_size;
-                  g_autofree char *old_metadata = NULL;
-
-                  /* See if we already have the info on this revision */
-                  if (g_hash_table_lookup (commit_data_cache, old_rev))
-                    continue;
-
-                  g_variant_get_child (old_commit_data_v, 0, "t", &old_installed_size);
-                  old_installed_size = GUINT64_FROM_BE (old_installed_size);
-                  g_variant_get_child (old_commit_data_v, 1, "t", &old_download_size);
-                  old_download_size = GUINT64_FROM_BE (old_download_size);
-                  g_variant_get_child (old_commit_data_v, 2, "s", &old_metadata);
-
-                  old_rev_data = g_new (CommitData, 1);
-                  old_rev_data->installed_size = old_installed_size;
-                  old_rev_data->download_size = old_download_size;
-                  old_rev_data->metadata_contents = g_steal_pointer (&old_metadata);
-
-                  g_hash_table_insert (commit_data_cache, g_steal_pointer (&old_rev), old_rev_data);
-                }
-            }
-        }
+      populate_commit_data_cache (extensions, old_summary, commit_data_cache);
     }
 
   ordered_keys = g_hash_table_get_keys (refs);
@@ -2978,23 +3250,42 @@ flatpak_repo_update (OstreeRepo   *repo,
       guint64 installed_size = 0;
       guint64 download_size = 0;
       g_autofree char *metadata_contents = NULL;
+      g_autofree char *commit = NULL;
+      g_autoptr(GVariant) commit_v = NULL;
+      g_autoptr(GVariant) commit_metadata = NULL;
       CommitData *rev_data;
 
       /* See if we already have the info on this revision */
       if (g_hash_table_lookup (commit_data_cache, rev))
         continue;
 
-      if (!ostree_repo_read_commit (repo, rev, &root, NULL, NULL, error))
+      if (!ostree_repo_read_commit (repo, rev, &root, &commit, NULL, error))
         return FALSE;
 
-      if (!flatpak_repo_collect_sizes (repo, root, &installed_size, &download_size, cancellable, error))
+      if (!ostree_repo_load_commit (repo, commit, &commit_v, NULL, error))
         return FALSE;
+
+      commit_metadata = g_variant_get_child_value (commit_v, 0);
+      if (!g_variant_lookup (commit_metadata, "xa.metadata", "s", &metadata_contents))
+        {
+          metadata = g_file_get_child (root, "metadata");
+          if (!g_file_load_contents (metadata, cancellable, &metadata_contents, NULL, NULL, NULL))
+            metadata_contents = g_strdup ("");
+        }
+
+      if (g_variant_lookup (commit_metadata, "xa.installed-size", "t", &installed_size) &&
+          g_variant_lookup (commit_metadata, "xa.download-size", "t", &download_size))
+        {
+          installed_size = GUINT64_FROM_BE (installed_size);
+          download_size = GUINT64_FROM_BE (download_size);
+        }
+      else
+        {
+          if (!flatpak_repo_collect_sizes (repo, root, &installed_size, &download_size, cancellable, error))
+            return FALSE;
+        }
 
       flatpak_repo_collect_extra_data_sizes (repo, rev, &installed_size, &download_size);
-
-      metadata = g_file_get_child (root, "metadata");
-      if (!g_file_load_contents (metadata, cancellable, &metadata_contents, NULL, NULL, NULL))
-        metadata_contents = g_strdup ("");
 
       rev_data = g_new (CommitData, 1);
       rev_data->installed_size = installed_size;
@@ -3018,10 +3309,81 @@ flatpak_repo_update (OstreeRepo   *repo,
                              rev_data->metadata_contents);
     }
 
+  /* Note: xa.cache doesn’t need to support collection IDs for the refs listed
+   * in it, because the xa.cache metadata is stored on the ostree-metadata ref,
+   * which is itself strongly bound to a collection ID — so that collection ID
+   * is bound to all the refs in xa.cache. If a client is using the xa.cache
+   * data from a summary file (rather than an ostree-metadata branch), they are
+   * too old to care about collection IDs anyway. */
   g_variant_builder_add (&builder, "{sv}", "xa.cache",
                          g_variant_new_variant (g_variant_builder_end (&ref_data_builder)));
 
   new_summary = g_variant_ref_sink (g_variant_builder_end (&builder));
+
+  /* Write out a new metadata commit for the repository. */
+  if (collection_id != NULL)
+    {
+#ifdef FLATPAK_ENABLE_P2P
+      OstreeCollectionRef collection_ref = { (gchar *) collection_id, (gchar *) OSTREE_REPO_METADATA_REF };
+      g_autofree gchar *new_ostree_metadata_checksum = NULL;
+      g_autoptr(OstreeMutableTree) mtree = NULL;
+      g_autoptr(OstreeRepoFile) repo_file = NULL;
+      g_autoptr(GVariantDict) new_summary_commit_dict = NULL;
+      g_autoptr(GVariant) new_summary_commit = NULL;
+
+      /* Add bindings to the metadata. */
+      new_summary_commit_dict = g_variant_dict_new (new_summary);
+      g_variant_dict_insert (new_summary_commit_dict, "ostree.collection-binding",
+                             "s", collection_ref.collection_id);
+      g_variant_dict_insert_value (new_summary_commit_dict, "ostree.ref-binding",
+                                   g_variant_new_strv ((const gchar * const *) &collection_ref.ref_name, 1));
+      new_summary_commit = g_variant_ref_sink (g_variant_dict_end (new_summary_commit_dict));
+
+      if (!ostree_repo_prepare_transaction (repo, NULL, cancellable, error))
+        goto out;
+
+      mtree = ostree_mutable_tree_new ();
+      if (!ostree_repo_write_dfd_to_mtree (repo, AT_FDCWD, ".", mtree, NULL, NULL, error))
+        goto out;
+      if (!ostree_repo_write_mtree (repo, mtree, (GFile **) &repo_file, NULL, error))
+        goto out;
+
+      if (!ostree_repo_write_commit (repo, old_ostree_metadata_checksum,
+                                     NULL  /* subject */, NULL  /* body */,
+                                     new_summary_commit, repo_file, &new_ostree_metadata_checksum,
+                                     NULL, error))
+        goto out;
+
+      if (gpg_key_ids != NULL)
+        {
+          const char * const *iter;
+
+          for (iter = gpg_key_ids; iter != NULL && *iter != NULL; iter++)
+            {
+              const char *key_id = *iter;
+
+              if (!ostree_repo_sign_commit (repo,
+                                            new_ostree_metadata_checksum,
+                                            key_id,
+                                            gpg_homedir,
+                                            cancellable,
+                                            error))
+                goto out;
+            }
+        }
+
+      ostree_repo_transaction_set_collection_ref (repo, &collection_ref,
+                                                  new_ostree_metadata_checksum);
+
+      if (!ostree_repo_commit_transaction (repo, NULL, cancellable, error))
+        goto out;
+#else  /* if !FLATPAK_ENABLE_P2P */
+      g_assert_not_reached ();
+      goto out;
+#endif  /* FLATPAK_ENABLE_P2P */
+    }
+
+  /* Regenerate and re-sign the summary file. */
   if (!ostree_repo_regenerate_summary (repo, new_summary, cancellable, error))
     return FALSE;
 
@@ -3036,6 +3398,11 @@ flatpak_repo_update (OstreeRepo   *repo,
     }
 
   return TRUE;
+
+out:
+  if (repo != NULL)
+    ostree_repo_abort_transaction (repo, cancellable, NULL);
+  return FALSE;
 }
 
 gboolean
@@ -3046,7 +3413,7 @@ flatpak_mtree_create_root (OstreeRepo        *repo,
 {
   g_autoptr(GVariant) dirmeta = NULL;
   g_autoptr(GFileInfo) file_info = g_file_info_new ();
-  g_autofree guchar *csum;
+  g_autofree guchar *csum = NULL;
   g_autofree char *checksum = NULL;
 
   g_file_info_set_name (file_info, "/");
@@ -3110,7 +3477,9 @@ validate_component (FlatpakXml *component,
 
   id_text = g_strstrip (g_strdup (id_text_node->text));
 
-  if (g_str_has_suffix (id_text, ".desktop"))
+  /* Drop .desktop file suffix (unless the actual app id ends with .desktop) */
+  if (g_str_has_suffix (id_text, ".desktop") &&
+      !g_str_has_suffix (id, ".desktop"))
     id_text[strlen(id_text)-strlen(".desktop")] = 0;
 
   if (!g_str_has_prefix (id_text, id))
@@ -3129,7 +3498,7 @@ validate_component (FlatpakXml *component,
   bundle->attribute_values[0] = g_strdup ("flatpak");
 
   i = 1;
-  if (runtime)
+  if (runtime && !g_str_has_prefix (runtime, "runtime/"))
     {
       bundle->attribute_names[i] = g_strdup ("runtime");
       bundle->attribute_values[i] = g_strdup (runtime);
@@ -3207,13 +3576,15 @@ flatpak_appstream_xml_migrate (FlatpakXml *source,
     return FALSE;
 
   if (g_str_has_prefix (ref, "app/"))
-    group = "Application";
+    group = FLATPAK_METADATA_GROUP_APPLICATION;
   else
-    group = "Runtime";
+    group = FLATPAK_METADATA_GROUP_RUNTIME;
 
-  tags = g_key_file_get_string_list (metadata, group, "tags", NULL, NULL);
-  runtime = g_key_file_get_string (metadata, group, "runtime", NULL);
-  sdk = g_key_file_get_string (metadata, group, "sdk", NULL);
+  tags = g_key_file_get_string_list (metadata, group, FLATPAK_METADATA_KEY_TAGS,
+                                     NULL, NULL);
+  runtime = g_key_file_get_string (metadata, group,
+                                   FLATPAK_METADATA_KEY_RUNTIME, NULL);
+  sdk = g_key_file_get_string (metadata, group, FLATPAK_METADATA_KEY_SDK, NULL);
 
   source_components = source->first_child;
   dest_components = dest->first_child;
@@ -3443,17 +3814,23 @@ gboolean
 flatpak_repo_generate_appstream (OstreeRepo   *repo,
                                  const char  **gpg_key_ids,
                                  const char   *gpg_homedir,
+                                 guint64       timestamp,
                                  GCancellable *cancellable,
                                  GError      **error)
 {
   g_autoptr(GHashTable) all_refs = NULL;
-  g_autoptr(GHashTable) arches = NULL;
+  g_autoptr(GHashTable) arches = NULL;  /* (element-type utf8 utf8) */
   GHashTableIter iter;
   gpointer key;
-  gpointer value;
-  gboolean skip_commit = FALSE;
+  const char *collection_id;
 
   arches = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+
+#ifdef FLATPAK_ENABLE_P2P
+  collection_id = ostree_repo_get_collection_id (repo);
+#else  /* if !FLATPAK_ENABLE_P2P */
+  collection_id = NULL;
+#endif  /* !FLATPAK_ENABLE_P2P */
 
   if (!ostree_repo_list_refs (repo,
                               NULL,
@@ -3463,7 +3840,7 @@ flatpak_repo_generate_appstream (OstreeRepo   *repo,
     return FALSE;
 
   g_hash_table_iter_init (&iter, all_refs);
-  while (g_hash_table_iter_next (&iter, &key, &value))
+  while (g_hash_table_iter_next (&iter, &key, NULL))
     {
       const char *ref = key;
       const char *arch;
@@ -3475,11 +3852,11 @@ flatpak_repo_generate_appstream (OstreeRepo   *repo,
 
       arch = split[2];
       if (!g_hash_table_contains (arches, arch))
-        g_hash_table_insert (arches, g_strdup (arch), GINT_TO_POINTER (1));
+        g_hash_table_add (arches, g_strdup (arch));
     }
 
   g_hash_table_iter_init (&iter, arches);
-  while (g_hash_table_iter_next (&iter, &key, &value))
+  while (g_hash_table_iter_next (&iter, &key, NULL))
     {
       GHashTableIter iter2;
       const char *arch = key;
@@ -3495,6 +3872,7 @@ flatpak_repo_generate_appstream (OstreeRepo   *repo,
       g_autofree char *branch = NULL;
       g_autoptr(FlatpakXml) appstream_root = NULL;
       g_autoptr(GBytes) xml_data = NULL;
+      gboolean skip_commit = FALSE;
 
       if (g_mkdtemp_full (tmpdir, 0755) == NULL)
         return flatpak_fail (error, "Can't create temporary directory");
@@ -3504,7 +3882,7 @@ flatpak_repo_generate_appstream (OstreeRepo   *repo,
       appstream_root = flatpak_appstream_xml_new ();
 
       g_hash_table_iter_init (&iter2, all_refs);
-      while (g_hash_table_iter_next (&iter2, &key, &value))
+      while (g_hash_table_iter_next (&iter2, &key, NULL))
         {
           const char *ref = key;
           g_auto(GStrv) split = NULL;
@@ -3554,7 +3932,8 @@ flatpak_repo_generate_appstream (OstreeRepo   *repo,
 
       mtree = ostree_mutable_tree_new ();
 
-      modifier = ostree_repo_commit_modifier_new (OSTREE_REPO_COMMIT_MODIFIER_FLAGS_SKIP_XATTRS,
+      modifier = ostree_repo_commit_modifier_new (OSTREE_REPO_COMMIT_MODIFIER_FLAGS_SKIP_XATTRS |
+                                                  OSTREE_REPO_COMMIT_MODIFIER_FLAGS_CANONICAL_PERMISSIONS,
                                                   (OstreeRepoCommitFilter) commit_filter, NULL, NULL);
 
       if (!ostree_repo_write_directory_to_mtree (repo, G_FILE (tmpdir_file), mtree, modifier, cancellable, error))
@@ -3573,15 +3952,42 @@ flatpak_repo_generate_appstream (OstreeRepo   *repo,
             goto out;
 
           if (g_file_equal (root, parent_root))
-            skip_commit = TRUE;
+            {
+              skip_commit = TRUE;
+              g_debug ("Not updating %s, no change", branch);
+            }
         }
 
       if (!skip_commit)
         {
-          if (!ostree_repo_write_commit (repo, parent, "Update", NULL, NULL,
-                                         OSTREE_REPO_FILE (root),
-                                         &commit_checksum, cancellable, error))
-            goto out;
+          g_autoptr(GVariantDict) metadata_dict = NULL;
+          g_autoptr(GVariant) metadata = NULL;
+
+          /* Add bindings to the metadata. Do this even if P2P support is not
+           * enabled, as it might be enable for other flatpak builds. */
+          metadata_dict = g_variant_dict_new (NULL);
+          g_variant_dict_insert (metadata_dict, "ostree.collection-binding",
+                                 "s", (collection_id != NULL) ? collection_id : "");
+          g_variant_dict_insert_value (metadata_dict, "ostree.ref-binding",
+                                       g_variant_new_strv ((const gchar * const *) &branch, 1));
+          metadata = g_variant_ref_sink (g_variant_dict_end (metadata_dict));
+
+          if (timestamp > 0)
+            {
+              if (!ostree_repo_write_commit_with_time (repo, parent, "Update", NULL, metadata,
+                                                       OSTREE_REPO_FILE (root),
+                                                       timestamp,
+                                                       &commit_checksum,
+                                                       cancellable, error))
+                goto out;
+            }
+          else
+            {
+              if (!ostree_repo_write_commit (repo, parent, "Update", NULL, metadata,
+                                             OSTREE_REPO_FILE (root),
+                                             &commit_checksum, cancellable, error))
+                goto out;
+            }
 
           if (gpg_key_ids)
             {
@@ -3601,7 +4007,17 @@ flatpak_repo_generate_appstream (OstreeRepo   *repo,
                 }
             }
 
-          ostree_repo_transaction_set_ref (repo, NULL, branch, commit_checksum);
+#ifdef FLATPAK_ENABLE_P2P
+          if (collection_id != NULL)
+            {
+              const OstreeCollectionRef collection_ref = { (char *) collection_id, branch };
+              ostree_repo_transaction_set_collection_ref (repo, &collection_ref, commit_checksum);
+            }
+          else
+#endif  /* FLATPAK_ENABLE_P2P */
+            {
+              ostree_repo_transaction_set_ref (repo, NULL, branch, commit_checksum);
+            }
 
           if (!ostree_repo_commit_transaction (repo, &stats, cancellable, error))
             goto out;
@@ -3674,7 +4090,10 @@ flatpak_extension_new (const char *id,
       g_autofree char *metadata_path = g_build_filename (ext->files_path, "../metadata", NULL);
 
       if (g_key_file_load_from_file (keyfile, metadata_path, G_KEY_FILE_NONE, NULL))
-        ext->priority = g_key_file_get_integer (keyfile, "ExtensionOf", "priority", NULL);
+        ext->priority = g_key_file_get_integer (keyfile,
+                                                FLATPAK_METADATA_GROUP_EXTENSION_OF,
+                                                FLATPAK_METADATA_KEY_PRIORITY,
+                                                NULL);
     }
 
   return ext;
@@ -3713,13 +4132,107 @@ flatpak_extension_matches_reason (const char *extension_id,
   return FALSE;
 }
 
+static GList *
+add_extension (GKeyFile   *metakey,
+               const char *group,
+               const char *extension,
+               const char *arch,
+               const char *branch,
+               GList *res)
+{
+  FlatpakExtension *ext;
+  g_autofree char *directory = g_key_file_get_string (metakey, group,
+                                                      FLATPAK_METADATA_KEY_DIRECTORY,
+                                                      NULL);
+  g_autofree char *add_ld_path = g_key_file_get_string (metakey, group,
+                                                        FLATPAK_METADATA_KEY_ADD_LD_PATH,
+                                                        NULL);
+  g_auto(GStrv) merge_dirs = g_key_file_get_string_list (metakey, group,
+                                                         FLATPAK_METADATA_KEY_MERGE_DIRS,
+                                                         NULL, NULL);
+  g_autofree char *enable_if = g_key_file_get_string (metakey, group,
+                                                      FLATPAK_METADATA_KEY_ENABLE_IF,
+                                                      NULL);
+  g_autofree char *subdir_suffix = g_key_file_get_string (metakey, group,
+                                                          FLATPAK_METADATA_KEY_SUBDIRECTORY_SUFFIX,
+                                                          NULL);
+  g_autofree char *ref = NULL;
+  gboolean is_unmaintained = FALSE;
+  g_autoptr(GFile) files = NULL;
+
+  if (directory == NULL)
+    return res;
+
+  ref = g_build_filename ("runtime", extension, arch, branch, NULL);
+
+  files = flatpak_find_unmaintained_extension_dir_if_exists (extension, arch, branch, NULL);
+
+  if (files == NULL)
+    files = flatpak_find_files_dir_for_ref (ref, NULL, NULL);
+  else
+    is_unmaintained = TRUE;
+
+  /* Prefer a full extension (org.freedesktop.Locale) over subdirectory ones (org.freedesktop.Locale.sv) */
+  if (files != NULL)
+    {
+      if (flatpak_extension_matches_reason (extension, enable_if, TRUE))
+        {
+          ext = flatpak_extension_new (extension, extension, ref, directory, add_ld_path, subdir_suffix, merge_dirs, files, is_unmaintained);
+          res = g_list_prepend (res, ext);
+        }
+    }
+  else if (g_key_file_get_boolean (metakey, group,
+                                   FLATPAK_METADATA_KEY_SUBDIRECTORIES, NULL))
+    {
+      g_autofree char *prefix = g_strconcat (extension, ".", NULL);
+      g_auto(GStrv) refs = NULL;
+      g_auto(GStrv) unmaintained_refs = NULL;
+      int j;
+
+      refs = flatpak_list_deployed_refs ("runtime", prefix, arch, branch,
+                                         NULL, NULL);
+      for (j = 0; refs != NULL && refs[j] != NULL; j++)
+        {
+          g_autofree char *extended_dir = g_build_filename (directory, refs[j] + strlen (prefix), NULL);
+          g_autofree char *dir_ref = g_build_filename ("runtime", refs[j], arch, branch, NULL);
+          g_autoptr(GFile) subdir_files = flatpak_find_files_dir_for_ref (dir_ref, NULL, NULL);
+
+          if (subdir_files && flatpak_extension_matches_reason (refs[j], enable_if, TRUE))
+            {
+              ext = flatpak_extension_new (extension, refs[j], dir_ref, extended_dir, add_ld_path, subdir_suffix, merge_dirs, subdir_files, FALSE);
+              ext->needs_tmpfs = TRUE;
+              res = g_list_prepend (res, ext);
+            }
+        }
+
+      unmaintained_refs = flatpak_list_unmaintained_refs (prefix, arch, branch,
+                                                          NULL, NULL);
+      for (j = 0; unmaintained_refs != NULL && unmaintained_refs[j] != NULL; j++)
+        {
+          g_autofree char *extended_dir = g_build_filename (directory, unmaintained_refs[j] + strlen (prefix), NULL);
+          g_autofree char *dir_ref = g_build_filename ("runtime", unmaintained_refs[j], arch, branch, NULL);
+          g_autoptr(GFile) subdir_files = flatpak_find_unmaintained_extension_dir_if_exists (unmaintained_refs[j], arch, branch, NULL);
+
+          if (subdir_files && flatpak_extension_matches_reason (unmaintained_refs[j], enable_if, TRUE))
+            {
+              ext = flatpak_extension_new (extension, unmaintained_refs[j], dir_ref, extended_dir, add_ld_path, subdir_suffix, merge_dirs, subdir_files, TRUE);
+              ext->needs_tmpfs = TRUE;
+              res = g_list_prepend (res, ext);
+            }
+        }
+    }
+
+  return res;
+}
+
+
 GList *
 flatpak_list_extensions (GKeyFile   *metakey,
                          const char *arch,
                          const char *default_branch)
 {
   g_auto(GStrv) groups = NULL;
-  int i;
+  int i, j;
   GList *res;
 
   res = NULL;
@@ -3730,89 +4243,31 @@ flatpak_list_extensions (GKeyFile   *metakey,
   groups = g_key_file_get_groups (metakey, NULL);
   for (i = 0; groups[i] != NULL; i++)
     {
-      FlatpakExtension *ext;
       char *extension;
 
-      if (g_str_has_prefix (groups[i], "Extension ") &&
-          *(extension = (groups[i] + strlen ("Extension "))) != 0)
+      if (g_str_has_prefix (groups[i], FLATPAK_METADATA_GROUP_PREFIX_EXTENSION) &&
+          *(extension = (groups[i] + strlen (FLATPAK_METADATA_GROUP_PREFIX_EXTENSION))) != 0)
         {
-          g_autofree char *directory = g_key_file_get_string (metakey, groups[i], "directory", NULL);
-          g_autofree char *version = g_key_file_get_string (metakey, groups[i], "version", NULL);
-          g_autofree char *add_ld_path = g_key_file_get_string (metakey, groups[i], "add-ld-path", NULL);
-          g_auto(GStrv) merge_dirs = g_key_file_get_string_list (metakey, groups[i], "merge-dirs", NULL, NULL);
-          g_autofree char *enable_if = g_key_file_get_string (metakey, groups[i], "enable-if", NULL);
-          g_autofree char *subdir_suffix = g_key_file_get_string (metakey, groups[i], "subdirectory-suffix", NULL);
-          g_autofree char *ref = NULL;
-          const char *branch;
-          gboolean is_unmaintained = FALSE;
-          g_autoptr(GFile) files = NULL;
+          g_autofree char *version = g_key_file_get_string (metakey, groups[i],
+                                                            FLATPAK_METADATA_KEY_VERSION,
+                                                            NULL);
+          g_auto(GStrv) versions = g_key_file_get_string_list (metakey, groups[i],
+                                                               FLATPAK_METADATA_KEY_VERSIONS,
+                                                               NULL, NULL);
+          const char *default_branches[] = { default_branch, NULL};
+          const char **branches;
 
-          if (directory == NULL)
-            continue;
-
-          if (version)
-            branch = version;
+          if (versions)
+            branches = (const char **)versions;
           else
-            branch = default_branch;
-
-          ref = g_build_filename ("runtime", extension, arch, branch, NULL);
-
-          files = flatpak_find_unmaintained_extension_dir_if_exists (extension, arch, branch, NULL);
-
-          if (files == NULL)
-            files = flatpak_find_files_dir_for_ref (ref, NULL, NULL);
-          else
-            is_unmaintained = TRUE;
-
-          /* Prefer a full extension (org.freedesktop.Locale) over subdirectory ones (org.freedesktop.Locale.sv) */
-          if (files != NULL)
             {
-              if (flatpak_extension_matches_reason (extension, enable_if, TRUE))
-                {
-                  ext = flatpak_extension_new (extension, extension, ref, directory, add_ld_path, subdir_suffix, merge_dirs, files, is_unmaintained);
-                  res = g_list_prepend (res, ext);
-                }
+              if (version)
+                default_branches[0] = version;
+              branches = default_branches;
             }
-          else if (g_key_file_get_boolean (metakey, groups[i],
-                                           "subdirectories", NULL))
-            {
-              g_autofree char *prefix = g_strconcat (extension, ".", NULL);
-              g_auto(GStrv) refs = NULL;
-              g_auto(GStrv) unmaintained_refs = NULL;
-              int j;
 
-              refs = flatpak_list_deployed_refs ("runtime", prefix, arch, branch,
-                                                 NULL, NULL);
-              for (j = 0; refs != NULL && refs[j] != NULL; j++)
-                {
-                  g_autofree char *extended_dir = g_build_filename (directory, refs[j] + strlen (prefix), NULL);
-                  g_autofree char *dir_ref = g_build_filename ("runtime", refs[j], arch, branch, NULL);
-                  g_autoptr(GFile) subdir_files = flatpak_find_files_dir_for_ref (dir_ref, NULL, NULL);
-
-                  if (subdir_files && flatpak_extension_matches_reason (refs[j], enable_if, TRUE))
-                    {
-                      ext = flatpak_extension_new (extension, refs[j], dir_ref, extended_dir, add_ld_path, subdir_suffix, merge_dirs, subdir_files, FALSE);
-                      ext->needs_tmpfs = TRUE;
-                      res = g_list_prepend (res, ext);
-                    }
-                }
-
-              unmaintained_refs = flatpak_list_unmaintained_refs (prefix, arch, branch,
-                                                                  NULL, NULL);
-              for (j = 0; unmaintained_refs != NULL && unmaintained_refs[j] != NULL; j++)
-                {
-                  g_autofree char *extended_dir = g_build_filename (directory, unmaintained_refs[j] + strlen (prefix), NULL);
-                  g_autofree char *dir_ref = g_build_filename ("runtime", unmaintained_refs[j], arch, branch, NULL);
-                  g_autoptr(GFile) subdir_files = flatpak_find_unmaintained_extension_dir_if_exists (unmaintained_refs[j], arch, branch, NULL);
-
-                  if (subdir_files && flatpak_extension_matches_reason (unmaintained_refs[j], enable_if, TRUE))
-                    {
-                      ext = flatpak_extension_new (extension, unmaintained_refs[j], dir_ref, extended_dir, add_ld_path, subdir_suffix, merge_dirs, subdir_files, TRUE);
-                      ext->needs_tmpfs = TRUE;
-                      res = g_list_prepend (res, ext);
-                    }
-                }
-            }
+          for (j = 0; branches[j] != NULL; j++)
+            res = add_extension (metakey, groups[i], extension, arch, branches[j], res);
         }
     }
 
@@ -4136,6 +4591,7 @@ flatpak_bundle_load (GFile   *file,
                      char   **app_metadata,
                      guint64 *installed_size,
                      GBytes **gpg_keys,
+                     char   **collection_id,
                      GError **error)
 {
   g_autoptr(GVariant) delta = NULL;
@@ -4209,10 +4665,20 @@ flatpak_bundle_load (GFile   *file,
         *runtime_repo = NULL;
     }
 
+  if (collection_id != NULL)
+    {
+#ifdef FLATPAK_ENABLE_P2P
+      if (!g_variant_lookup (metadata, "collection-id", "s", collection_id))
+        *collection_id = NULL;
+#else  /* if !FLATPAK_ENABLE_P2P */
+      *collection_id = NULL;
+#endif  /* !FLATPAK_ENABLE_P2P */
+    }
+
   if (app_metadata != NULL)
     {
       if (!g_variant_lookup (metadata, "metadata", "s", app_metadata))
-        *runtime_repo = NULL;
+        *app_metadata = NULL;
     }
 
   if (gpg_keys != NULL)
@@ -4258,14 +4724,28 @@ flatpak_pull_from_bundle (OstreeRepo   *repo,
   g_autoptr(GError) my_error = NULL;
   g_autoptr(GVariant) metadata = NULL;
   gboolean metadata_valid;
+  g_autofree char *remote_collection_id = NULL;
+  g_autofree char *collection_id = NULL;
 
-  metadata = flatpak_bundle_load (file, &to_checksum, NULL, NULL, NULL, &metadata_contents, NULL, NULL, error);
+  metadata = flatpak_bundle_load (file, &to_checksum, NULL, NULL, NULL, &metadata_contents, NULL, NULL, &collection_id, error);
   if (metadata == NULL)
     return FALSE;
+
+#ifdef FLATPAK_ENABLE_P2P
+  if (!ostree_repo_get_remote_option (repo, remote, "collection-id", NULL,
+                                      &remote_collection_id, NULL))
+    remote_collection_id = NULL;
+#endif  /* FLATPAK_ENABLE_P2P */
+
+  if (remote_collection_id != NULL && collection_id != NULL &&
+      strcmp (remote_collection_id, collection_id) != 0)
+    return flatpak_fail (error, "Collection ‘%s’ of bundle doesn’t match collection ‘%s’ of remote",
+                         collection_id, remote_collection_id);
 
   if (!ostree_repo_prepare_transaction (repo, NULL, cancellable, error))
     return FALSE;
 
+  /* Don’t need to set the collection ID here, since the remote binds this ref to the collection. */
   ostree_repo_transaction_set_ref (repo, remote, ref, to_checksum);
 
   if (!ostree_repo_static_delta_execute_offline (repo,
@@ -4279,9 +4759,9 @@ flatpak_pull_from_bundle (OstreeRepo   *repo,
                                               NULL, NULL, cancellable, &my_error);
   if (gpg_result == NULL)
     {
-      /* NOT_FOUND means no gpg signature, we ignore this *if* there
-       * is no gpg key specified in the bundle or by the user */
-      if (g_error_matches (my_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND) &&
+      /* no gpg signature, we ignore this *if* there is no gpg key
+       * specified in the bundle or by the user */
+      if (g_error_matches (my_error, OSTREE_GPG_ERROR, OSTREE_GPG_ERROR_NO_SIGNATURE) &&
           !require_gpg_signature)
         {
           g_clear_error (&my_error);
@@ -4344,12 +4824,129 @@ flatpak_pull_from_bundle (OstreeRepo   *repo,
   return TRUE;
 }
 
+typedef struct {
+  FlatpakOciPullProgress progress_cb;
+  gpointer progress_user_data;
+  guint64 total_size;
+  guint64 previous_layers_size;
+  guint32 n_layers;
+  guint32 pulled_layers;
+} FlatpakOciPullProgressData;
+
+static void
+oci_layer_progress (guint64 downloaded_bytes,
+                    gpointer user_data)
+{
+  FlatpakOciPullProgressData *progress_data = user_data;
+
+  if (progress_data->progress_cb)
+    progress_data->progress_cb (progress_data->total_size, progress_data->previous_layers_size + downloaded_bytes,
+                                progress_data->n_layers, progress_data->pulled_layers,
+                                progress_data->progress_user_data);
+}
+
+gboolean
+flatpak_mirror_image_from_oci (FlatpakOciRegistry *dst_registry,
+                               FlatpakOciRegistry *registry,
+                               const char *digest,
+                               const char *signature_digest,
+                               FlatpakOciPullProgress progress_cb,
+                               gpointer progress_user_data,
+                               GCancellable *cancellable,
+                               GError      **error)
+{
+  FlatpakOciPullProgressData progress_data = { progress_cb, progress_user_data };
+  g_autoptr(FlatpakOciVersioned) versioned = NULL;
+  FlatpakOciManifest *manifest = NULL;
+  g_autoptr(FlatpakOciDescriptor) manifest_desc = NULL;
+  gsize versioned_size;
+  g_autoptr(FlatpakOciIndex) index = NULL;
+  int i;
+
+  if (!flatpak_oci_registry_mirror_blob (dst_registry, registry, digest, NULL, NULL, cancellable, error))
+    return FALSE;
+
+  if (signature_digest &&
+      !flatpak_oci_registry_mirror_blob (dst_registry, registry, signature_digest, NULL, NULL, cancellable, error))
+    return FALSE;
+
+  versioned = flatpak_oci_registry_load_versioned (dst_registry, digest, &versioned_size, cancellable, error);
+  if (versioned == NULL)
+    return FALSE;
+
+  if (!FLATPAK_IS_OCI_MANIFEST (versioned))
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                   "Image is not a manifest");
+      return FALSE;
+    }
+
+  manifest = FLATPAK_OCI_MANIFEST (versioned);
+
+  if (manifest->config.digest != NULL)
+    {
+      if (!flatpak_oci_registry_mirror_blob (dst_registry, registry, manifest->config.digest, NULL, NULL, cancellable, error))
+        return FALSE;
+    }
+
+  for (i = 0; manifest->layers[i] != NULL; i++)
+    {
+      FlatpakOciDescriptor *layer = manifest->layers[i];
+      progress_data.total_size += layer->size;
+      progress_data.n_layers++;
+    }
+
+  if (progress_cb)
+    progress_cb (progress_data.total_size, 0,
+                 progress_data.n_layers, progress_data.pulled_layers,
+                 progress_user_data);
+
+  for (i = 0; manifest->layers[i] != NULL; i++)
+    {
+      FlatpakOciDescriptor *layer = manifest->layers[i];
+
+      if (!flatpak_oci_registry_mirror_blob (dst_registry, registry, layer->digest,
+                                             oci_layer_progress, &progress_data,
+                                             cancellable, error))
+        return FALSE;
+
+      progress_data.pulled_layers++;
+      progress_data.previous_layers_size += layer->size;
+    }
+
+
+  index = flatpak_oci_registry_load_index (dst_registry, NULL, NULL, NULL, NULL);
+  if (index == NULL)
+    index = flatpak_oci_index_new ();
+
+  manifest_desc = flatpak_oci_descriptor_new (versioned->mediatype, digest, versioned_size);
+
+  flatpak_oci_export_annotations (manifest->annotations, manifest_desc->annotations);
+
+  if (signature_digest)
+    g_hash_table_replace (manifest_desc->annotations,
+                          g_strdup ("org.flatpak.signature-digest"),
+                          g_strdup (signature_digest));
+
+  flatpak_oci_index_add_manifest (index, manifest_desc);
+
+  if (!flatpak_oci_registry_save_index (dst_registry, index, cancellable, error))
+    return FALSE;
+
+  return TRUE;
+}
+
+
 char *
 flatpak_pull_from_oci (OstreeRepo   *repo,
                        FlatpakOciRegistry *registry,
                        const char *digest,
                        FlatpakOciManifest *manifest,
+                       const char *remote,
                        const char *ref,
+                       const char *signature_digest,
+                       FlatpakOciPullProgress progress_cb,
+                       gpointer progress_user_data,
                        GCancellable *cancellable,
                        GError      **error)
 {
@@ -4359,21 +4956,82 @@ flatpak_pull_from_oci (OstreeRepo   *repo,
   const char *parent = NULL;
   g_autofree char *subject = NULL;
   g_autofree char *body = NULL;
+  g_autofree char *manifest_ref = NULL;
+  g_autofree char *full_ref = NULL;
   guint64 timestamp = 0;
+  FlatpakOciPullProgressData progress_data = { progress_cb, progress_user_data };
   g_autoptr(GVariantBuilder) metadata_builder = g_variant_builder_new (G_VARIANT_TYPE ("a{sv}"));
   g_autoptr(GVariant) metadata = NULL;
   GHashTable *annotations;
+  gboolean gpg_verify = FALSE;
   int i;
 
   g_assert (ref != NULL);
   g_assert (g_str_has_prefix (digest, "sha256:"));
 
+  if (remote &&
+      !ostree_repo_remote_get_gpg_verify (repo, remote,
+                                          &gpg_verify, error))
+    return NULL;
+
+  if (gpg_verify)
+    {
+      g_autoptr(GBytes) signature_bytes = NULL;
+      g_autoptr(FlatpakOciSignature) signature = NULL;
+
+      if (signature_digest == NULL)
+        {
+          flatpak_fail (error, "GPG verification enabled, but no OCI signature found");
+          return NULL;
+        }
+
+      signature_bytes = flatpak_oci_registry_load_blob (registry, signature_digest, cancellable, error);
+      if (signature_bytes == NULL)
+        return NULL;
+
+      signature = flatpak_oci_verify_signature (repo, remote, signature_bytes, error);
+      if (signature == NULL)
+        return NULL;
+
+      if (g_strcmp0 (signature->critical.type, FLATPAK_OCI_SIGNATURE_TYPE_FLATPAK) != 0)
+        {
+          flatpak_fail (error, "Invalid signature type %s", signature->critical.type);
+          return NULL;
+        }
+
+      if (g_strcmp0 (signature->critical.image.digest, digest) != 0)
+        {
+          flatpak_fail (error, "Invalid signature digest %s", signature->critical.image.digest);
+          return NULL;
+        }
+
+      if (g_strcmp0 (signature->critical.identity.ref, ref) != 0)
+        {
+          flatpak_fail (error, "Invalid signature ref %s", signature->critical.identity.ref);
+          return NULL;
+        }
+
+      /* Success! It is valid */
+      g_debug ("Verified OCI signature for %s %s", signature->critical.identity.ref, digest);
+    }
+
   annotations = flatpak_oci_manifest_get_annotations (manifest);
   if (annotations)
     flatpak_oci_parse_commit_annotations (annotations, &timestamp,
                                           &subject, &body,
-                                          NULL, NULL, NULL,
+                                          &manifest_ref, NULL, NULL,
                                           metadata_builder);
+  if (manifest_ref == NULL)
+    {
+      flatpak_fail (error, "No ref specified for OCI image %s\n", digest);
+      return NULL;
+    }
+
+  if (strcmp (manifest_ref, ref) != 0)
+    {
+      flatpak_fail (error, "Wrong ref (%s) specified for OCI image %s, expected %s\n", manifest_ref, digest, ref);
+      return NULL;
+    }
 
   g_variant_builder_add (metadata_builder, "{s@v}", "xa.alt-id",
                          g_variant_new_variant (g_variant_new_string (digest + strlen("sha256:"))));
@@ -4388,15 +5046,29 @@ flatpak_pull_from_oci (OstreeRepo   *repo,
   for (i = 0; manifest->layers[i] != NULL; i++)
     {
       FlatpakOciDescriptor *layer = manifest->layers[i];
+      progress_data.total_size += layer->size;
+      progress_data.n_layers++;
+    }
+
+  if (progress_cb)
+    progress_cb (progress_data.total_size, 0,
+                 progress_data.n_layers, progress_data.pulled_layers,
+                 progress_user_data);
+
+  for (i = 0; manifest->layers[i] != NULL; i++)
+    {
+      FlatpakOciDescriptor *layer = manifest->layers[i];
       OstreeRepoImportArchiveOptions opts = { 0, };
-      free_read_archive struct archive *a = NULL;
+      g_autoptr(FlatpakAutoArchiveRead) a = NULL;
       glnx_fd_close int layer_fd = -1;
+      g_autoptr(GChecksum) checksum = g_checksum_new (G_CHECKSUM_SHA256);
+      const char *layer_checksum;
 
       opts.autocreate_parents = TRUE;
       opts.ignore_unsupported_content = TRUE;
 
       layer_fd = flatpak_oci_registry_download_blob (registry, layer->digest,
-                                                     NULL, NULL,
+                                                     oci_layer_progress, &progress_data,
                                                      cancellable, error);
       if (layer_fd == -1)
         goto error;
@@ -4408,11 +5080,9 @@ flatpak_pull_from_oci (OstreeRepo   *repo,
       archive_read_support_compression_all (a);
 #endif
       archive_read_support_format_all (a);
-      if (archive_read_open_fd (a, layer_fd, 8192) != ARCHIVE_OK)
-        {
-          propagate_libarchive_error (error, a);
-          goto error;
-        }
+
+      if (!flatpak_archive_read_open_fd_with_checksum (a, layer_fd, checksum, error))
+        goto error;
 
       if (!ostree_repo_import_archive_to_mtree (repo, &opts, a, archive_mtree, NULL, cancellable, error))
         goto error;
@@ -4422,6 +5092,17 @@ flatpak_pull_from_oci (OstreeRepo   *repo,
           propagate_libarchive_error (error, a);
           goto error;
         }
+
+      layer_checksum = g_checksum_get_string (checksum);
+      if (!g_str_has_prefix (layer->digest, "sha256:") ||
+          strcmp (layer->digest + strlen ("sha256:"), layer_checksum) != 0)
+        {
+          flatpak_fail (error, "Wrong layer checksum, expected %s, was %s\n", layer->digest, layer_checksum);
+          goto error;
+        }
+
+      progress_data.pulled_layers++;
+      progress_data.previous_layers_size += layer->size;
     }
 
   if (!ostree_repo_write_mtree (repo, archive_mtree, &archive_root, cancellable, error))
@@ -4442,7 +5123,14 @@ flatpak_pull_from_oci (OstreeRepo   *repo,
                                            cancellable, error))
     goto error;
 
-  ostree_repo_transaction_set_ref (repo, NULL, ref, commit_checksum);
+  if (remote)
+    full_ref = g_strdup_printf ("%s:%s", remote, ref);
+  else
+    full_ref = g_strdup (ref);
+
+  /* Don’t need to set the collection ID here, since the ref is bound to a
+   * collection via its remote. */
+  ostree_repo_transaction_set_ref (repo, NULL, full_ref, commit_checksum);
 
   if (!ostree_repo_commit_transaction (repo, NULL, cancellable, error))
     return NULL;
@@ -4545,20 +5233,16 @@ flatpak_allocate_tmpdir (int           tmpdir_dfd,
   while (tmpdir_name == NULL)
     {
       g_autofree char *tmpdir_name_template = g_strconcat (tmpdir_prefix, "XXXXXX", NULL);
-      glnx_fd_close int new_tmpdir_fd = -1;
       g_autoptr(GError) local_error = NULL;
       g_autofree char *lock_name = NULL;
-
+      g_auto(GLnxTmpDir) new_tmpdir = { 0, };
       /* No existing tmpdir found, create a new */
 
-      if (!glnx_mkdtempat (dfd_iter.fd, tmpdir_name_template, 0777, error))
+      if (!glnx_mkdtempat (dfd_iter.fd, tmpdir_name_template, 0777,
+                           &new_tmpdir, error))
         return FALSE;
 
-      if (!glnx_opendirat (dfd_iter.fd, tmpdir_name_template, FALSE,
-                           &new_tmpdir_fd, error))
-        return FALSE;
-
-      lock_name = g_strconcat (tmpdir_name_template, "-lock", NULL);
+      lock_name = g_strconcat (new_tmpdir.path, "-lock", NULL);
 
       /* Note, at this point we can race with another process that picks up this
        * new directory. If that happens we need to retry, making a new directory. */
@@ -4567,6 +5251,7 @@ flatpak_allocate_tmpdir (int           tmpdir_dfd,
         {
           if (g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK))
             {
+              glnx_tmpdir_unset (&new_tmpdir); /* Don't delete */
               continue;
             }
           else
@@ -4576,8 +5261,9 @@ flatpak_allocate_tmpdir (int           tmpdir_dfd,
             }
         }
 
-      tmpdir_name = g_steal_pointer (&tmpdir_name_template);
-      tmpdir_fd = glnx_steal_fd (&new_tmpdir_fd);
+      tmpdir_name = g_strdup (new_tmpdir.path);
+      tmpdir_fd = dup (new_tmpdir.fd);
+      glnx_tmpdir_unset (&new_tmpdir); /* Don't delete */
     }
 
   if (tmpdir_name_out)
@@ -4599,9 +5285,13 @@ flatpak_yes_no_prompt (const char *prompt, ...)
   va_list var_args;
   gchar *s;
 
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
   va_start (var_args, prompt);
   s = g_strdup_vprintf (prompt, var_args);
   va_end (var_args);
+#pragma GCC diagnostic pop
 
   while (TRUE)
     {
@@ -4630,6 +5320,9 @@ flatpak_yes_no_prompt (const char *prompt, ...)
 static gboolean
 is_number (const char *s)
 {
+  if (*s == '\0')
+    return FALSE;
+
   while (*s != 0)
     {
       if (!g_ascii_isdigit (*s))
@@ -4688,6 +5381,7 @@ typedef struct {
   GCancellable *cancellable;
   gpointer user_data;
   guint64 last_progress_time;
+  char *etag;
 } LoadUriData;
 
 static void
@@ -4698,7 +5392,7 @@ stream_closed (GObject *source, GAsyncResult *res, gpointer user_data)
   g_autoptr(GError) error = NULL;
 
   if (!g_input_stream_close_finish (stream, res, &error))
-    g_warning ("Error closing http stream: %s\n", error->message);
+    g_warning ("Error closing http stream: %s", error->message);
 
   g_main_loop_quit (data->loop);
 }
@@ -4774,10 +5468,15 @@ load_uri_callback (GObject *source_object,
   g_autoptr(SoupMessage) msg = soup_request_http_get_message ((SoupRequestHTTP*) request);
   if (!SOUP_STATUS_IS_SUCCESSFUL (msg->status_code))
     {
-      GIOErrorEnum code;
+      int code;
+      GQuark domain = G_IO_ERROR;
 
       switch (msg->status_code)
         {
+        case 304:
+          domain = FLATPAK_OCI_ERROR;
+          code = FLATPAK_OCI_ERROR_NOT_CHANGED;
+          break;
         case 404:
         case 410:
           code = G_IO_ERROR_NOT_FOUND;
@@ -4786,13 +5485,15 @@ load_uri_callback (GObject *source_object,
           code = G_IO_ERROR_FAILED;
         }
 
-      data->error = g_error_new (G_IO_ERROR, code,
+      data->error = g_error_new (domain, code,
                                  "Server returned status %u: %s",
                                  msg->status_code,
                                  soup_status_get_phrase (msg->status_code));
       g_main_loop_quit (data->loop);
       return;
     }
+
+  data->etag = g_strdup (soup_message_headers_get_one (msg->response_headers, "ETag"));
 
   g_input_stream_read_async (in, data->buffer, sizeof (data->buffer),
                              G_PRIORITY_DEFAULT, data->cancellable,
@@ -4827,7 +5528,9 @@ flatpak_create_soup_session (const char *user_agent)
 
 GBytes *
 flatpak_load_http_uri (SoupSession *soup_session,
-                       const char   *uri,
+                       const char *uri,
+                       const char *etag,
+                       char      **out_etag,
                        FlatpakLoadUriProgress progress,
                        gpointer      user_data,
                        GCancellable *cancellable,
@@ -4857,6 +5560,12 @@ flatpak_load_http_uri (SoupSession *soup_session,
   if (request == NULL)
     return NULL;
 
+  if (etag)
+    {
+      SoupMessage *m = soup_request_http_get_message (request);
+      soup_message_headers_replace (m->request_headers, "If-None-Match", etag);
+    }
+
   soup_request_send_async (SOUP_REQUEST(request),
                            cancellable,
                            load_uri_callback, &data);
@@ -4866,11 +5575,17 @@ flatpak_load_http_uri (SoupSession *soup_session,
   if (data.error)
     {
       g_propagate_error (error, data.error);
+      g_free (data.etag);
       return NULL;
     }
 
   bytes = g_string_free_to_bytes (g_steal_pointer (&content));
-  g_debug ("Received %" G_GSIZE_FORMAT " bytes", data.downloaded_bytes);
+  g_debug ("Received %" G_GUINT64_FORMAT " bytes", data.downloaded_bytes);
+
+  if (out_etag)
+    *out_etag = g_steal_pointer (&data.etag);
+
+  g_free (data.etag);
 
   return bytes;
 }
@@ -4918,7 +5633,7 @@ flatpak_download_http_uri (SoupSession *soup_session,
       return FALSE;
     }
 
-  g_debug ("Received %" G_GSIZE_FORMAT " bytes", data.downloaded_bytes);
+  g_debug ("Received %" G_GUINT64_FORMAT " bytes", data.downloaded_bytes);
 
   return TRUE;
 }
@@ -4956,10 +5671,11 @@ is_word_separator (char c)
 }
 
 void
-flatpak_complete_file (FlatpakCompletion *completion)
+flatpak_complete_file (FlatpakCompletion *completion,
+                       const char        *file_type)
 {
   flatpak_completion_debug ("completing FILE");
-  g_print ("%s\n", "__FLATPAK_FILE");
+  g_print ("%s\n", file_type);
 }
 
 void
@@ -4976,24 +5692,35 @@ flatpak_complete_word (FlatpakCompletion *completion,
   va_list args;
   const char *rest;
   const char *shell_cur;
+  const char *shell_cur_end;
   g_autofree char *string = NULL;
 
   g_return_if_fail (format != NULL);
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
   va_start (args, format);
   string = g_strdup_vprintf (format, args);
   va_end (args);
+#pragma GCC diagnostic pop
 
   if (!g_str_has_prefix (string, completion->cur))
     return;
 
   shell_cur = completion->shell_cur ? completion->shell_cur : "";
 
-  /* I'm not sure exactly what bash is doing here, but this seems to work... */
-  if (strcmp (shell_cur, "=") == 0)
-    rest = string + strlen (completion->cur) - strlen (shell_cur) + 1;
-  else
-    rest = string + strlen (completion->cur) - strlen (shell_cur);
+  rest = string + strlen (completion->cur);
+
+  shell_cur_end = shell_cur + strlen(shell_cur);
+  while (shell_cur_end > shell_cur &&
+         rest > string &&
+         shell_cur_end[-1] == rest[-1] &&
+         /* I'm not sure exactly what bash is doing here with =, but this seems to work... */
+         shell_cur_end[-1] != '=')
+    {
+      rest--;
+      shell_cur_end--;
+    }
 
   flatpak_completion_debug ("completing word: '%s' (%s)", string, rest);
 
@@ -5026,7 +5753,7 @@ flatpak_complete_ref (FlatpakCompletion *completion,
     }
 }
 
-int
+static int
 find_current_element (const char *str)
 {
   int count = 0;
@@ -5205,7 +5932,7 @@ flatpak_complete_options (FlatpakCompletion *completion,
                 }
               else if (strcmp (e->arg_description, "FILE") == 0)
                 {
-                  flatpak_complete_file (completion);
+                  flatpak_complete_file (completion, "__FLATPAK_FILE");
                 }
               else
                 flatpak_complete_word (completion, "%s", prefix);
@@ -5416,4 +6143,295 @@ flatpak_get_current_locale_subpaths (void)
   g_ptr_array_add (subpaths, NULL);
 
   return (char **)g_ptr_array_free (subpaths, FALSE);
+}
+
+#define BAR_LENGTH 20
+#define BAR_CHARS " -=#"
+
+void
+flatpak_terminal_progress_cb (const char *status,
+                              guint       progress,
+                              gboolean    estimating,
+                              gpointer    user_data)
+{
+  g_autoptr(GString) str = g_string_new ("");
+  FlatpakTerminalProgress *term = user_data;
+  int i;
+  int n_full, remainder, partial;
+  int width, padded_width;
+
+  if (!term->inited)
+    {
+      struct winsize w;
+      ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
+      term->n_columns = w.ws_col;
+      term->last_width = 0;
+      term->inited = 1;
+    }
+
+  g_string_append (str, "[");
+
+  n_full = (BAR_LENGTH * progress) / 100;
+  remainder = progress - (n_full * 100 / BAR_LENGTH);
+  partial = (remainder * strlen(BAR_CHARS) * BAR_LENGTH) / 100;
+
+  for (i = 0; i < n_full; i++)
+    g_string_append_c (str, BAR_CHARS[strlen(BAR_CHARS)-1]);
+
+  if (i < BAR_LENGTH)
+    {
+      g_string_append_c (str, BAR_CHARS[partial]);
+      i++;
+    }
+
+  for (; i < BAR_LENGTH; i++)
+    g_string_append (str, " ");
+
+  g_string_append (str, "] ");
+  g_string_append (str, status);
+
+  g_print ("\r");
+  width = MIN (strlen (str->str), term->n_columns);
+  padded_width = MAX (term->last_width, width);
+  term->last_width = width;
+  g_print ("%-*.*s", padded_width, padded_width, str->str);
+}
+
+void
+flatpak_terminal_progress_end (FlatpakTerminalProgress *term)
+{
+  if (term->inited)
+    g_print("\n");
+}
+
+static inline guint
+get_write_progress (guint outstanding_writes)
+{
+  return outstanding_writes > 0 ? (guint) (3 / (gdouble) outstanding_writes) : 3;
+}
+
+static void
+progress_cb (OstreeAsyncProgress *progress, gpointer user_data)
+{
+  gboolean last_was_metadata = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (progress), "last-was-metadata"));
+  FlatpakProgressCallback progress_cb = g_object_get_data (G_OBJECT (progress), "callback");
+  guint last_progress = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (progress), "last_progress"));
+  GString *buf;
+  g_autofree char *status = NULL;
+  guint outstanding_fetches;
+  guint outstanding_metadata_fetches;
+  guint outstanding_writes;
+  guint64 bytes_transferred;
+  guint64 fetched_delta_part_size;
+  guint64 total_delta_part_size;
+  guint outstanding_extra_data;
+  guint64 total_extra_data_bytes;
+  guint64 transferred_extra_data_bytes;
+  guint64 total;
+  guint metadata_fetched;
+  guint64 start_time;
+  guint64 elapsed_time;
+  guint new_progress = 0;
+  gboolean estimating = FALSE;
+  gboolean downloading_extra_data;
+  gboolean scanning;
+  guint n_scanned_metadata;
+  guint fetched_delta_parts;
+  guint total_delta_parts;
+  guint fetched_delta_part_fallbacks;
+  guint total_delta_part_fallbacks;
+  guint fetched;
+  guint requested;
+  guint64 total_transferred;
+  g_autofree gchar *formatted_bytes_total_transferred = NULL;
+
+  /* We get some extra calls before we've really started due to the initialization of the
+     extra data, so ignore those */
+  if (ostree_async_progress_get_variant (progress, "outstanding-fetches") == NULL)
+    return;
+
+  buf = g_string_new ("");
+
+  /* The heuristic here goes as follows:
+   *  - While fetching metadata, grow up to 5%
+   *  - Download goes up to 97%
+   *  - Writing objects adds the last 3%
+   *
+   *
+   * Meaning of each variable:
+   *
+   *   Status:
+   *    - status: only sent by OSTree when the pull ends (with or without an error)
+   *
+   *   Fetches:
+   *    - fetched: sum of content + metadata fetches
+   *    - requested: sum of requested content and metadata fetches
+   *    - bytes_transferred: every and all tranferred data (in bytes)
+   *    - metadata_fetched: the number of fetched metadata objects
+   *    - outstanding_fetches: missing fetches (metadata + content + deltas)
+   *    - outstanding_delta_fetches: missing delta-only fetches
+   *    - outstanding_metadata_fetches: missing metadata-only fetches
+   *    - fetched_content_bytes: the estimated downloaded size of content (in bytes)
+   *    - total_content_bytes: the estimated total size of content, based on average bytes per object (in bytes)
+   *
+   *   Writes:
+   *    - outstanding_writes: all missing writes (sum of outstanding content, metadata and delta writes)
+   *
+   *   Static deltas:
+   *    - total_delta_part_size: the total size (in bytes) of static deltas
+   *    - fetched_delta_part_size: the size (in bytes) of already fetched static deltas
+   *
+   *   Extra data:
+   *    - total_extra_data_bytes: the sum of all extra data file sizes (in bytes)
+   *    - downloading_extra_data: whether extra-data files are being downloaded or not
+   */
+
+  /* We request everything in one go to make sure we don't race with the update from
+     the async download and get mixed results */
+  ostree_async_progress_get (progress,
+                             "outstanding-fetches", "u", &outstanding_fetches,
+                             "outstanding-metadata-fetches", "u", &outstanding_metadata_fetches,
+                             "outstanding-writes", "u", &outstanding_writes,
+                             "scanning", "u", &scanning,
+                             "scanned-metadata", "u", &n_scanned_metadata,
+                             "fetched-delta-parts", "u", &fetched_delta_parts,
+                             "total-delta-parts", "u", &total_delta_parts,
+                             "fetched-delta-fallbacks", "u", &fetched_delta_part_fallbacks,
+                             "total-delta-fallbacks", "u", &total_delta_part_fallbacks,
+                             "fetched-delta-part-size", "t", &fetched_delta_part_size,
+                             "total-delta-part-size", "t", &total_delta_part_size,
+                             "bytes-transferred", "t", &bytes_transferred,
+                             "fetched", "u", &fetched,
+                             "metadata-fetched", "u", &metadata_fetched,
+                             "requested", "u", &requested,
+                             "start-time", "t", &start_time,
+                             "status", "s", &status,
+                             "outstanding-extra-data", "u", &outstanding_extra_data,
+                             "total-extra-data-bytes", "t", &total_extra_data_bytes,
+                             "transferred-extra-data-bytes", "t", &transferred_extra_data_bytes,
+                             "downloading-extra-data", "u", &downloading_extra_data,
+                             NULL);
+
+  elapsed_time = (g_get_monotonic_time () - start_time) / G_USEC_PER_SEC;
+
+  /* When we receive the status, it means that the ostree pull operation is
+   * finished. We only have to be careful about the extra-data fields. */
+  if (status && *status && total_extra_data_bytes == 0)
+    {
+      g_string_append (buf, status);
+      new_progress = 100;
+      goto out;
+    }
+
+  total_transferred = bytes_transferred + transferred_extra_data_bytes;
+  formatted_bytes_total_transferred =  g_format_size_full (total_transferred, 0);
+
+  g_object_set_data (G_OBJECT (progress), "last-was-metadata", GUINT_TO_POINTER (FALSE));
+
+  if (total_delta_parts == 0 &&
+      (outstanding_metadata_fetches > 0 || last_was_metadata)  &&
+      metadata_fetched < 20)
+    {
+      /* We need to hit two callbacks with no metadata outstanding, because
+         sometimes we get called when we just handled a metadata, but did
+         not yet process it and add more metadata */
+      if (outstanding_metadata_fetches > 0)
+        g_object_set_data (G_OBJECT (progress), "last-was-metadata", GUINT_TO_POINTER (TRUE));
+
+      /* At this point we don't really know how much data there is, so we have to make a guess.
+       * Since its really hard to figure out early how much data there is we report 1% until
+       * all objects are scanned. */
+
+      estimating = TRUE;
+
+      g_string_append_printf (buf, "Downloading metadata: %u/(estimating) %s",
+                              fetched, formatted_bytes_total_transferred);
+
+      /* Go up to 5% until the metadata is all fetched */
+      new_progress = 0;
+      if (requested > 0)
+        new_progress = fetched * 5 / requested;
+    }
+  else
+    {
+      if (total_delta_parts > 0)
+        {
+          g_autofree gchar *formatted_bytes_total = NULL;
+
+          /* We're only using deltas, so we can ignore regular objects
+           * and get perfect sizes.
+           *
+           * fetched_delta_part_size is the total size of all the
+           * delta parts and fallback objects that were already
+           * available at the start and need not be downloaded.
+           */
+          total = total_delta_part_size - fetched_delta_part_size + total_extra_data_bytes;
+          formatted_bytes_total = g_format_size_full (total, 0);
+
+          g_string_append_printf (buf, "Downloading: %s/%s",
+                                  formatted_bytes_total_transferred,
+                                  formatted_bytes_total);
+        }
+      else
+        {
+          /* Non-deltas, so we can't know anything other than object
+             counts, except the additional extra data which we know
+             the byte size of. To be able to compare them with the
+             extra data we use the average object size to estimate a
+             total size. */
+          double average_object_size = 1;
+          if (fetched > 0)
+            average_object_size = bytes_transferred / (double)fetched;
+
+          total = average_object_size * requested + total_extra_data_bytes;
+
+          if (downloading_extra_data)
+            {
+              g_autofree gchar *formatted_bytes_total = g_format_size_full (total, 0);;
+              g_string_append_printf (buf, "Downloading extra data: %s/%s",
+                                      formatted_bytes_total_transferred,
+                                      formatted_bytes_total);
+            }
+          else
+            g_string_append_printf (buf, "Downloading files: %d/%d %s",
+                                    fetched, requested, formatted_bytes_total_transferred);
+        }
+
+      /* The download progress goes up to 97% */
+      new_progress = 5 + ((total_transferred / (gdouble) total) * 92);
+
+      /* And the writing of the objects adds 3% to the progress */
+      new_progress += get_write_progress (outstanding_writes);
+    }
+
+  if (elapsed_time > 0) // Ignore first second
+    {
+      g_autofree gchar *formatted_bytes_sec = g_format_size (total_transferred / elapsed_time);
+      g_string_append_printf (buf, " (%s/s)", formatted_bytes_sec);
+    }
+
+out:
+  if (new_progress < last_progress)
+    new_progress = last_progress;
+  g_object_set_data (G_OBJECT (progress), "last_progress", GUINT_TO_POINTER (new_progress));
+
+  progress_cb (buf->str, new_progress, estimating, user_data);
+
+  g_string_free (buf, TRUE);
+}
+
+OstreeAsyncProgress *
+flatpak_progress_new (FlatpakProgressCallback progress,
+                      gpointer                progress_data)
+{
+  OstreeAsyncProgress *ostree_progress =
+    ostree_async_progress_new_and_connect (progress_cb,
+                                           progress_data);
+  g_object_set_data (G_OBJECT (ostree_progress), "callback", progress);
+  g_object_set_data (G_OBJECT (ostree_progress), "last_progress", GUINT_TO_POINTER (0));
+
+  if (progress == flatpak_terminal_progress_cb)
+    g_object_set_data (G_OBJECT (ostree_progress), "update-frequency", GUINT_TO_POINTER (FLATPAK_CLI_UPDATE_FREQUENCY));
+
+  return ostree_progress;
 }

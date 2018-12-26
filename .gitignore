@@ -24,6 +24,7 @@ libtool
 ltmain.sh
 m4/*.m4
 !m4/glibtests.m4
+!m4/attributes.m4
 missing
 stamp-h1
 config.h.in
@@ -36,7 +37,6 @@ xdg-document-portal
 xdg-permission-store
 flatpak-builder
 testdb
-doc/*.1
 *~
 profile/flatpak.sh
 flatpak-dbus.[ch]
@@ -66,9 +66,8 @@ Flatpak-1.0.*
 /doc/reference/version.xml
 /doc/flatpak-docs.html
 /doc/flatpak-docs.xml
-/doc/flatpak-metadata.5
-/doc/flatpak-flatpakrepo.5
-/doc/flatpak-flatpakref.5
+/doc/*.1
+/doc/*.5
 /test-doc-portal
 /test-doc-portal.log
 /test-doc-portal.trs
@@ -77,6 +76,9 @@ Flatpak-1.0.*
 /tests/test-keyring/.gpg-v21-migrated
 /tests/test-keyring/private-keys-v1.d/
 /tests/test-keyring/trustdb.gpg
+/tests/test-keyring2/.gpg-v21-migrated
+/tests/test-keyring2/private-keys-v1.d/
+/tests/test-keyring2/trustdb.gpg
 /tests/hello*.flatpak
 /tests/platform*.flatpak
 /tests/repo

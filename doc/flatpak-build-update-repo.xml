@@ -69,6 +69,14 @@
             </varlistentry>
 
             <varlistentry>
+                <term><option>--redirect-url=URL</option></term>
+
+                <listitem><para>
+                    Redirect this repo to a new URL.
+                </para></listitem>
+            </varlistentry>
+
+            <varlistentry>
                 <term><option>--title=TITLE</option></term>
 
                 <listitem><para>
@@ -76,6 +84,51 @@
                     The title is stored in the repository summary.
                 </para></listitem>
             </varlistentry>
+
+            <varlistentry>
+                <term><option>--default-branch=BRANCH</option></term>
+
+                <listitem><para>
+                    A default branch for the repository, mainly for use in a UI.
+                </para></listitem>
+            </varlistentry>
+
+            <varlistentry>
+                <term><option>--gpg-import=FILE</option></term>
+
+                <listitem><para>
+                    Import a new default GPG public key from the
+                    given file.
+                </para></listitem>
+            </varlistentry>
+
+            <!-- FIXME: Uncomment this when enable-p2p is enabled unconditionally.
+            <varlistentry>
+                <term><option>-FIXME-collection-id=COLLECTION-ID</option></term>
+
+                <listitem><para>
+                    The globally unique identifier of the remote repository, to
+                    allow mirrors to be grouped. This must be set to a globally
+                    unique reverse DNS string if the repository is to be made
+                    publicly available. If a collection ID is already set on an
+                    existing repository, this will update it. If not specified,
+                    the existing collection ID will be left unchanged.
+                </para></listitem>
+            </varlistentry>
+
+            <varlistentry>
+                <term><option>-FIXME-deploy-collection-id</option></term>
+
+                <listitem><para>
+                    Deploy the collection ID (set using <option>-FIXME-collection-id</option>
+                    in the static remote configuration for all clients. This is
+                    irrevocable once published in a repository. Use it to decide
+                    when to roll out a collection ID to users of an existing repository.
+                    If constructing a new repository which has a collection ID,
+                    you should typically always pass this option.
+                </para></listitem>
+            </varlistentry>
+            -->
 
             <varlistentry>
                 <term><option>--gpg-sign=KEYID</option></term>
@@ -107,7 +160,7 @@
                 <term><option>--prune</option></term>
 
                 <listitem><para>
-                    Remove unreferences objects in repo.
+                    Remove unreferenced objects in repo.
                 </para></listitem>
             </varlistentry>
 

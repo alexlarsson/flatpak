@@ -48,6 +48,8 @@ static char *opt_runtime_repo;
 static gboolean opt_runtime = FALSE;
 static char **opt_gpg_file;
 static gboolean opt_oci = FALSE;
+static char **opt_gpg_key_ids;
+static char *opt_gpg_homedir;
 
 static GOptionEntry options[] = {
   { "runtime", 0, 0, G_OPTION_ARG_NONE, &opt_runtime, N_("Export runtime instead of app"), NULL },
@@ -56,6 +58,8 @@ static GOptionEntry options[] = {
   { "runtime-repo", 0, 0, G_OPTION_ARG_STRING, &opt_runtime_repo, N_("Url for runtime flatpakrepo file"), N_("URL") },
   { "gpg-keys", 0, 0, G_OPTION_ARG_FILENAME_ARRAY, &opt_gpg_file, N_("Add GPG key from FILE (- for stdin)"), N_("FILE") },
   { "oci", 0, 0, G_OPTION_ARG_NONE, &opt_oci, N_("Export oci image instead of flatpak bundle"), NULL },
+  { "gpg-sign", 0, 0, G_OPTION_ARG_STRING_ARRAY, &opt_gpg_key_ids, N_("GPG Key ID to sign the OCI image with"), N_("KEY-ID") },
+  { "gpg-homedir", 0, 0, G_OPTION_ARG_STRING, &opt_gpg_homedir, N_("GPG Homedir to use when looking for keyrings"), N_("HOMEDIR") },
 
   { NULL }
 };
@@ -122,6 +126,7 @@ build_bundle (OstreeRepo *repo, GFile *file,
   g_autoptr(GBytes) gpg_data = NULL;
   g_autoptr(GVariant) params = NULL;
   g_autoptr(GVariant) metadata = NULL;
+  const char *collection_id;
 
   if (!ostree_repo_resolve_rev (repo, full_branch, FALSE, &commit_checksum, error))
     return FALSE;
@@ -227,6 +232,14 @@ build_bundle (OstreeRepo *repo, GFile *file,
   if (opt_runtime_repo)
     g_variant_builder_add (&metadata_builder, "{sv}", "runtime-repo", g_variant_new_string (opt_runtime_repo));
 
+#ifdef FLATPAK_ENABLE_P2P
+  collection_id = ostree_repo_get_collection_id (repo);
+#else  /* if !FLATPAK_ENABLE_P2P */
+  collection_id = NULL;
+#endif  /* !FLATPAK_ENABLE_P2P */
+  g_variant_builder_add (&metadata_builder, "{sv}", "collection-id",
+                         g_variant_new_string (collection_id ? collection_id : ""));
+
   if (opt_gpg_file != NULL)
     {
       gpg_data = read_gpg_data (cancellable, error);
@@ -312,15 +325,17 @@ build_oci (OstreeRepo *repo, GFile *dir,
   g_autofree char *uncompressed_digest = NULL;
   g_autofree char *timestamp = NULL;
   g_autoptr(FlatpakOciImage) image = NULL;
-  g_autoptr(FlatpakOciRef) layer_ref = NULL;
-  g_autoptr(FlatpakOciRef) image_ref = NULL;
-  g_autoptr(FlatpakOciRef) manifest_ref = NULL;
+  g_autoptr(FlatpakOciDescriptor) layer_desc = NULL;
+  g_autoptr(FlatpakOciDescriptor) image_desc = NULL;
+  g_autoptr(FlatpakOciDescriptor) manifest_desc = NULL;
   g_autoptr(FlatpakOciManifest) manifest = NULL;
+  g_autoptr(FlatpakOciIndex) index = NULL;
   g_autoptr(GFile) metadata_file = NULL;
   guint64 installed_size = 0;
   GHashTable *annotations;
   gsize metadata_size;
   g_autofree char *metadata_contents = NULL;
+  g_auto(GStrv) ref_parts = NULL;
 
   if (!ostree_repo_resolve_rev (repo, ref, FALSE, &commit_checksum, error))
     return FALSE;
@@ -332,6 +347,10 @@ build_oci (OstreeRepo *repo, GFile *dir,
     return FALSE;
 
   if (!ostree_repo_read_commit_detached_metadata (repo, commit_checksum, &commit_metadata, cancellable, error))
+    return FALSE;
+
+  ref_parts = flatpak_decompose_ref (ref, error);
+  if (ref_parts == NULL)
     return FALSE;
 
   dir_uri = g_file_get_uri (dir);
@@ -351,7 +370,7 @@ build_oci (OstreeRepo *repo, GFile *dir,
 
   if (!flatpak_oci_layer_writer_close (layer_writer,
                                        &uncompressed_digest,
-                                       &layer_ref,
+                                       &layer_desc,
                                        cancellable,
                                        error))
     return FALSE;
@@ -359,17 +378,18 @@ build_oci (OstreeRepo *repo, GFile *dir,
 
   image = flatpak_oci_image_new ();
   flatpak_oci_image_set_layer (image, uncompressed_digest);
+  flatpak_oci_image_set_architecture (image, flatpak_arch_to_oci_arch (ref_parts[2]));
 
   timestamp = timestamp_to_iso8601 (ostree_commit_get_timestamp (commit_data));
   flatpak_oci_image_set_created (image, timestamp);
 
-  image_ref = flatpak_oci_registry_store_json (registry, FLATPAK_JSON (image), cancellable, error);
-  if (image_ref == NULL)
+  image_desc = flatpak_oci_registry_store_json (registry, FLATPAK_JSON (image), cancellable, error);
+  if (image_desc == NULL)
     return FALSE;
 
   manifest = flatpak_oci_manifest_new ();
-  flatpak_oci_manifest_set_config (manifest, image_ref);
-  flatpak_oci_manifest_set_layer (manifest, layer_ref);
+  flatpak_oci_manifest_set_config (manifest, image_desc);
+  flatpak_oci_manifest_set_layer (manifest, layer_desc);
 
   annotations = flatpak_oci_manifest_get_annotations (manifest);
   flatpak_oci_add_annotations_for_commit (annotations, ref, commit_checksum, commit_data);
@@ -379,7 +399,7 @@ build_oci (OstreeRepo *repo, GFile *dir,
       g_utf8_validate (metadata_contents, -1, NULL))
     {
       g_hash_table_replace (annotations,
-                            g_strdup ("org.flatpak.Metadata"),
+                            g_strdup ("org.flatpak.metadata"),
                             g_steal_pointer (&metadata_contents));
     }
 
@@ -387,15 +407,46 @@ build_oci (OstreeRepo *repo, GFile *dir,
     return FALSE;
 
   g_hash_table_replace (annotations,
-                        g_strdup ("org.flatpak.InstalledSize"),
+                        g_strdup ("org.flatpak.installed-size"),
                         g_strdup_printf ("%" G_GUINT64_FORMAT, installed_size));
 
-  manifest_ref = flatpak_oci_registry_store_json (registry, FLATPAK_JSON (manifest), cancellable, error);
-  if (manifest_ref == NULL)
+  g_hash_table_replace (annotations,
+                        g_strdup ("org.flatpak.download-size"),
+                        g_strdup_printf ("%" G_GUINT64_FORMAT, layer_desc->size));
+
+  manifest_desc = flatpak_oci_registry_store_json (registry, FLATPAK_JSON (manifest), cancellable, error);
+  if (manifest_desc == NULL)
     return FALSE;
 
-  if (!flatpak_oci_registry_set_ref (registry, "latest", manifest_ref,
-                                     cancellable, error))
+  flatpak_oci_export_annotations (manifest->annotations, manifest_desc->annotations);
+
+  if (opt_gpg_key_ids)
+    {
+      g_autoptr(FlatpakOciSignature) sig = flatpak_oci_signature_new (manifest_desc->digest, ref);
+      g_autoptr(GBytes) sig_bytes = flatpak_json_to_bytes (FLATPAK_JSON (sig));
+      g_autoptr(GBytes) res = NULL;
+      g_autofree char *signature_digest = NULL;
+
+      res = flatpak_oci_sign_data (sig_bytes, (const char **)opt_gpg_key_ids, opt_gpg_homedir, error);
+      if (res == NULL)
+        return FALSE;
+
+      signature_digest = flatpak_oci_registry_store_blob (registry, res, cancellable, error);
+      if (signature_digest == NULL)
+        return FALSE;
+
+      g_hash_table_replace (manifest_desc->annotations,
+                            g_strdup ("org.flatpak.signature-digest"),
+                            g_strdup (signature_digest));
+    }
+
+  index = flatpak_oci_registry_load_index (registry, NULL, NULL, NULL, NULL);
+  if (index == NULL)
+    index = flatpak_oci_index_new ();
+
+  flatpak_oci_index_add_manifest (index, manifest_desc);
+
+  if (!flatpak_oci_registry_save_index (registry, index, cancellable, error))
     return FALSE;
 
   return TRUE;
@@ -442,21 +493,26 @@ flatpak_builtin_build_bundle (int argc, char **argv, GCancellable *cancellable, 
   if (!g_file_query_exists (repofile, cancellable))
     return flatpak_fail (error, _("'%s' is not a valid repository"), location);
 
-  file = g_file_new_for_commandline_arg (filename);
-
-  if (!flatpak_is_valid_name (name, &my_error))
-    return flatpak_fail (error, _("'%s' is not a valid name: %s"), name, my_error->message);
-
-  if (!flatpak_is_valid_branch (branch, &my_error))
-    return flatpak_fail (error, _("'%s' is not a valid branch name: %s"), branch, &my_error);
-
-  if (opt_runtime)
-    full_branch = flatpak_build_runtime_ref (name, branch, opt_arch);
-  else
-    full_branch = flatpak_build_app_ref (name, branch, opt_arch);
-
   if (!ostree_repo_open (repo, cancellable, error))
     return FALSE;
+
+  file = g_file_new_for_commandline_arg (filename);
+
+  if (ostree_repo_resolve_rev (repo, name, FALSE, NULL, NULL))
+    full_branch = g_strdup (name);
+  else
+    {
+      if (!flatpak_is_valid_name (name, &my_error))
+        return flatpak_fail (error, _("'%s' is not a valid name: %s"), name, my_error->message);
+
+      if (!flatpak_is_valid_branch (branch, &my_error))
+        return flatpak_fail (error, _("'%s' is not a valid branch name: %s"), branch, my_error->message);
+
+      if (opt_runtime)
+        full_branch = flatpak_build_runtime_ref (name, branch, opt_arch);
+      else
+        full_branch = flatpak_build_app_ref (name, branch, opt_arch);
+    }
 
   if (opt_oci)
     {
@@ -494,7 +550,7 @@ flatpak_complete_build_bundle (FlatpakCompletion *completion)
       break;
 
     case 2: /* FILENAME */
-      flatpak_complete_file (completion);
+      flatpak_complete_file (completion, "__FLATPAK_BUNDLE_FILE");
       break;
     }
 

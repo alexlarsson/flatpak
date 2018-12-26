@@ -31,11 +31,20 @@
 #include "flatpak-dbus.h"
 #include <ostree.h>
 #include <json-glib/json-glib.h>
+#include "document-portal/xdp-dbus.h"
 
 typedef enum {
   FLATPAK_HOST_COMMAND_FLAGS_CLEAR_ENV = 1 << 0,
 } FlatpakHostCommandFlags;
 
+typedef void (*FlatpakLoadUriProgress) (guint64 downloaded_bytes,
+                                        gpointer user_data);
+
+
+#define FLATPAK_ANSI_BOLD_ON "\x1b[1m"
+#define FLATPAK_ANSI_BOLD_OFF "\x1b[22m"
+#define FLATPAK_ANSI_RED "\x1b[31m"
+#define FLATPAK_ANSI_COLOR_RESET "\x1b[0m"
 
 /* https://bugzilla.gnome.org/show_bug.cgi?id=766370 */
 #if !GLIB_CHECK_VERSION(2, 49, 3)
@@ -46,9 +55,11 @@ typedef enum {
 #define FLATPAK_VARIANT_DICT_INITIALIZER {{{0,}}}
 #endif
 
-gboolean flatpak_fail (GError    **error,
-                       const char *format,
-                       ...);
+/* https://github.com/GNOME/libglnx/pull/38
+ * Note by using #define rather than wrapping via a static inline, we
+ * don't have to re-define attributes like G_GNUC_PRINTF.
+ */
+#define flatpak_fail glnx_throw
 
 gint flatpak_strcmp0_ptr (gconstpointer a,
                           gconstpointer b);
@@ -61,8 +72,11 @@ const char * flatpak_path_match_prefix (const char *pattern,
 
 gboolean flatpak_is_in_sandbox (void);
 
+gboolean flatpak_fancy_output (void);
+
 const char * flatpak_get_arch (void);
 const char ** flatpak_get_arches (void);
+gboolean flatpak_is_linux32_arch (const char *arch);
 
 const char ** flatpak_get_gl_drivers (void);
 gboolean flatpak_extension_matches_reason (const char *extension_id,
@@ -78,7 +92,7 @@ void flatpak_migrate_from_xdg_app (void);
 GFile *flatpak_file_new_tmp_in (GFile *dir,
                                 const char *templatename,
                                 GError        **error);
-gboolean flatpak_unbreak_hardlink (GFile *file, GError **error);
+gboolean flatpak_break_hardlink (GFile *file, GError **error);
 
 gboolean flatpak_write_update_checksum (GOutputStream  *out,
                                         gconstpointer   data,
@@ -88,9 +102,12 @@ gboolean flatpak_write_update_checksum (GOutputStream  *out,
                                         GCancellable   *cancellable,
                                         GError        **error);
 
+
 gboolean flatpak_splice_update_checksum (GOutputStream  *out,
                                          GInputStream   *in,
                                          GChecksum      *checksum,
+                                         FlatpakLoadUriProgress progress,
+                                         gpointer        progress_data,
                                          GCancellable   *cancellable,
                                          GError        **error);
 
@@ -111,11 +128,14 @@ gboolean flatpak_variant_bsearch_str (GVariant   *array,
                                       int        *out_pos);
 GVariant *flatpak_repo_load_summary (OstreeRepo *repo,
                                      GError **error);
-char **  flatpak_summary_match_subrefs (GVariant *summary,
+char **  flatpak_summary_match_subrefs (GVariant   *summary,
+                                        const char *collection_id,
                                         const char *ref);
-gboolean flatpak_summary_lookup_ref (GVariant   *summary,
-                                     const char *ref,
-                                     char      **out_checksum);
+gboolean flatpak_summary_lookup_ref (GVariant    *summary,
+                                     const char  *collection_id,
+                                     const char  *ref,
+                                     char       **out_checksum,
+                                     GVariant   **out_variant);
 
 gboolean flatpak_has_name_prefix (const char *string,
                                   const char *name);
@@ -123,6 +143,9 @@ gboolean flatpak_is_valid_name (const char *string,
                                 GError **error);
 gboolean flatpak_is_valid_branch (const char *string,
                                   GError **error);
+
+char * flatpak_make_valid_id_prefix (const char *orig_id);
+gboolean flatpak_id_has_subref_suffix (const char *id);
 
 char **flatpak_decompose_ref (const char *ref,
                               GError    **error);
@@ -162,6 +185,9 @@ char * flatpak_build_runtime_ref (const char *runtime,
 char * flatpak_build_app_ref (const char *app,
                               const char *branch,
                               const char *arch);
+char * flatpak_find_current_ref (const char *app_id,
+                                 GCancellable *cancellable,
+                                 GError      **error);
 GFile *flatpak_find_deploy_dir_for_ref (const char   *ref,
                                         FlatpakDir **dir_out,
                                         GCancellable *cancellable,
@@ -265,27 +291,24 @@ gint flatpak_mkstempat (int    dir_fd,
                         int    flags,
                         int    mode);
 
-
-typedef struct FlatpakTablePrinter FlatpakTablePrinter;
-
-FlatpakTablePrinter *flatpak_table_printer_new (void);
-void                flatpak_table_printer_free (FlatpakTablePrinter *printer);
-void                flatpak_table_printer_add_column (FlatpakTablePrinter *printer,
-                                                      const char          *text);
-void                flatpak_table_printer_add_column_len (FlatpakTablePrinter *printer,
-                                                          const char          *text,
-                                                          gsize                len);
-void                flatpak_table_printer_append_with_comma (FlatpakTablePrinter *printer,
-                                                             const char          *text);
-void                flatpak_table_printer_finish_row (FlatpakTablePrinter *printer);
-void                flatpak_table_printer_print (FlatpakTablePrinter *printer);
-
 gboolean flatpak_repo_set_title (OstreeRepo *repo,
                                  const char *title,
                                  GError    **error);
+gboolean flatpak_repo_set_redirect_url (OstreeRepo *repo,
+                                        const char *redirect_url,
+                                        GError    **error);
 gboolean flatpak_repo_set_default_branch (OstreeRepo *repo,
                                           const char *branch,
                                           GError    **error);
+gboolean flatpak_repo_set_collection_id (OstreeRepo  *repo,
+                                         const char  *collection_id,
+                                         GError     **error);
+gboolean flatpak_repo_set_deploy_collection_id (OstreeRepo  *repo,
+                                                gboolean     deploy_collection_id,
+                                                GError     **error);
+gboolean flatpak_repo_set_gpg_keys (OstreeRepo *repo,
+                                    GBytes *bytes,
+                                    GError    **error);
 gboolean flatpak_repo_update (OstreeRepo   *repo,
                               const char  **gpg_key_ids,
                               const char   *gpg_homedir,
@@ -323,6 +346,7 @@ GVariant * flatpak_bundle_load (GFile   *file,
                                 char   **app_metadata,
                                 guint64 *installed_size,
                                 GBytes **gpg_keys,
+                                char   **collection_id,
                                 GError **error);
 
 gboolean flatpak_pull_from_bundle (OstreeRepo   *repo,
@@ -333,13 +357,30 @@ gboolean flatpak_pull_from_bundle (OstreeRepo   *repo,
                                    GCancellable *cancellable,
                                    GError      **error);
 
+typedef void (*FlatpakOciPullProgress) (guint64 total_size, guint64 pulled_size,
+                                        guint32 n_layers, guint32 pulled_layers,
+                                        gpointer data);
+
 char * flatpak_pull_from_oci (OstreeRepo   *repo,
                               FlatpakOciRegistry *registry,
                               const char *digest,
                               FlatpakOciManifest *manifest,
+                              const char *remote,
                               const char *ref,
+                              const char *signature_digest,
+                              FlatpakOciPullProgress progress_cb,
+                              gpointer progress_data,
                               GCancellable *cancellable,
                               GError      **error);
+
+gboolean flatpak_mirror_image_from_oci (FlatpakOciRegistry *dst_registry,
+                                        FlatpakOciRegistry *registry,
+                                        const char *digest,
+                                        const char *signature_digest,
+                                        FlatpakOciPullProgress progress_cb,
+                                        gpointer progress_data,
+                                        GCancellable *cancellable,
+                                        GError      **error);
 
 typedef struct
 {
@@ -362,6 +403,9 @@ GList *flatpak_list_extensions (GKeyFile   *metakey,
                                 const char *arch,
                                 const char *branch);
 
+char * flatpak_quote_argv (const char *argv[]);
+gboolean flatpak_file_arg_has_suffix (const char *arg, const char *suffix);
+
 gboolean            flatpak_spawn (GFile       *dir,
                                    char       **output,
                                    GError     **error,
@@ -370,20 +414,21 @@ gboolean            flatpak_spawn (GFile       *dir,
 
 gboolean            flatpak_spawnv (GFile                *dir,
                                     char                **output,
+                                    GSubprocessFlags      flags,
                                     GError              **error,
                                     const gchar * const  *argv);
 
 const char *flatpak_file_get_path_cached (GFile *file);
+
+GFile *flatpak_build_file_va (GFile *base,
+                              va_list args);
+GFile *flatpak_build_file (GFile *base, ...) G_GNUC_NULL_TERMINATED;
 
 gboolean flatpak_openat_noatime (int            dfd,
                                  const char    *name,
                                  int           *ret_fd,
                                  GCancellable  *cancellable,
                                  GError       **error);
-
-gboolean flatpak_copy_bytes (int fdf,
-                             int fdt,
-                             GError **error);
 
 typedef enum {
   FLATPAK_CP_FLAGS_NONE = 0,
@@ -429,8 +474,6 @@ gboolean flatpak_open_in_tmpdir_at (int                tmpdir_fd,
                                     GCancellable      *cancellable,
                                     GError           **error);
 
-#define flatpak_autorm_rf _GLIB_CLEANUP (g_autoptr_cleanup_generic_gfree)
-
 static inline void
 flatpak_temp_dir_destroy (void *p)
 {
@@ -475,12 +518,22 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC (FlatpakRepoTransaction, flatpak_repo_transaction_
 
 #define AUTOLOCK(name) G_GNUC_UNUSED __attribute__((cleanup (flatpak_auto_unlock_helper))) GMutex * G_PASTE (auto_unlock, __LINE__) = flatpak_auto_lock_helper (&G_LOCK_NAME (name))
 
+/* OSTREE_CHECK_VERSION was added immediately after the 2017.3 release */
+#ifndef OSTREE_CHECK_VERSION
+#define OSTREE_CHECK_VERSION(year, minor) (0)
+#endif
+/* Cleanups are always exported in 2017.4, and some git releases between 2017.3 and 2017.4.
+   We actually check against 2017.3 so that we work on the git releases *after* 2017.3
+   which is safe, because the real OSTREE_CHECK_VERSION macro was added after 2017.3
+   too. */
+#if !OSTREE_CHECK_VERSION(2017, 3)
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (OstreeRepo, g_object_unref)
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (OstreeMutableTree, g_object_unref)
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (OstreeAsyncProgress, g_object_unref)
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (OstreeGpgVerifyResult, g_object_unref)
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (OstreeRepoCommitModifier, ostree_repo_commit_modifier_unref)
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (OstreeRepoDevInoCache, ostree_repo_devino_cache_unref)
+#endif
 
 #ifndef SOUP_AUTOCLEANUPS_H
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (SoupSession, g_object_unref)
@@ -510,6 +563,8 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC(GUnixFDList, g_object_unref)
  */
 typedef FlatpakSessionHelper AutoFlatpakSessionHelper;
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (AutoFlatpakSessionHelper, g_object_unref)
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (XdpDbusDocuments, g_object_unref)
 
 typedef struct FlatpakXml FlatpakXml;
 
@@ -556,6 +611,7 @@ GBytes *flatpak_appstream_xml_root_to_data (FlatpakXml *appstream_root,
 gboolean   flatpak_repo_generate_appstream (OstreeRepo   *repo,
                                             const char  **gpg_key_ids,
                                             const char   *gpg_homedir,
+                                            guint64       timestamp,
                                             GCancellable *cancellable,
                                             GError      **error);
 
@@ -570,15 +626,14 @@ gboolean flatpak_allocate_tmpdir (int           tmpdir_dfd,
                                   GError      **error);
 
 
-gboolean flatpak_yes_no_prompt (const char *prompt, ...);
-long flatpak_number_prompt (int min, int max, const char *prompt, ...);
-
-typedef void (*FlatpakLoadUriProgress) (guint64 downloaded_bytes,
-                                        gpointer user_data);
+gboolean flatpak_yes_no_prompt (const char *prompt, ...) G_GNUC_PRINTF(1, 2);
+long flatpak_number_prompt (int min, int max, const char *prompt, ...) G_GNUC_PRINTF(3, 4);
 
 SoupSession * flatpak_create_soup_session (const char *user_agent);
 GBytes * flatpak_load_http_uri (SoupSession *soup_session,
                                 const char   *uri,
+                                const char   *etag,
+                                char        **out_etag,
                                 FlatpakLoadUriProgress progress,
                                 gpointer      user_data,
                                 GCancellable *cancellable,
@@ -610,7 +665,7 @@ FlatpakCompletion *flatpak_completion_new   (const char        *arg_line,
                                              const char        *arg_cur);
 void               flatpak_complete_word    (FlatpakCompletion *completion,
                                              char              *format,
-                                             ...);
+                                             ...) G_GNUC_PRINTF(2,3);
 void               flatpak_complete_ref     (FlatpakCompletion *completion,
                                              OstreeRepo        *repo);
 void               flatpak_complete_partial_ref (FlatpakCompletion *completion,
@@ -618,10 +673,31 @@ void               flatpak_complete_partial_ref (FlatpakCompletion *completion,
                                                  const char *only_arch,
                                                  FlatpakDir *dir,
                                                  const char *remote);
-void               flatpak_complete_file    (FlatpakCompletion *completion);
+void               flatpak_complete_file    (FlatpakCompletion *completion,
+                                             const char        *file_type);
 void               flatpak_complete_dir     (FlatpakCompletion *completion);
 void               flatpak_complete_options (FlatpakCompletion *completion,
                                              GOptionEntry      *entries);
 void               flatpak_completion_free  (FlatpakCompletion *completion);
+
+typedef struct {
+  int inited;
+  int n_columns;
+  int last_width;
+} FlatpakTerminalProgress;
+
+void flatpak_terminal_progress_cb (const char *status,
+                                   guint       progress,
+                                   gboolean    estimating,
+                                   gpointer    user_data);
+void flatpak_terminal_progress_end (FlatpakTerminalProgress *term);
+
+typedef void (*FlatpakProgressCallback)(const char *status,
+                                        guint       progress,
+                                        gboolean    estimating,
+                                        gpointer    user_data);
+
+OstreeAsyncProgress *flatpak_progress_new (FlatpakProgressCallback progress,
+                                           gpointer                progress_data);
 
 #endif /* __FLATPAK_UTILS_H__ */

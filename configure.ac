@@ -15,12 +15,13 @@ AC_PREREQ([2.63])
 
 m4_define([flatpak_major_version], [0])
 m4_define([flatpak_minor_version], [9])
-m4_define([flatpak_micro_version], [1])
-m4_define([flatpak_interface_age], [1])
+m4_define([flatpak_micro_version], [98])
+m4_define([flatpak_extra_version], [.2])
+m4_define([flatpak_interface_age], [98])
 m4_define([flatpak_binary_age],
           [m4_eval(10000 * flatpak_major_version + 100 * flatpak_minor_version + flatpak_micro_version)])
 m4_define([flatpak_version],
-          [flatpak_major_version.flatpak_minor_version.flatpak_micro_version])
+          [flatpak_major_version.flatpak_minor_version.flatpak_micro_version()flatpak_extra_version])
 
 AC_INIT([Flatpak],
         [flatpak_version],
@@ -28,11 +29,12 @@ AC_INIT([Flatpak],
         [flatpak],
         [http://flatpak.org/])
 
-GLIB_REQS=2.40
-SYSTEM_BWRAP_REQS=0.1.5
-OSTREE_REQS=2016.14
+GLIB_REQS=2.44
+SYSTEM_BWRAP_REQS=0.1.8
+OSTREE_REQS=2017.11
 
 AC_USE_SYSTEM_EXTENSIONS
+AC_SYS_LARGEFILE
 
 AC_PROG_CC
 AM_PROG_CC_C_O
@@ -44,7 +46,7 @@ LT_INIT([disable-static])
 AC_CONFIG_SRCDIR([common/flatpak-dir.c])
 AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_MACRO_DIR([m4])
-AM_INIT_AUTOMAKE([1.11 no-define no-dist-gzip dist-xz tar-ustar foreign subdir-objects])
+AM_INIT_AUTOMAKE([1.13.4 no-define no-dist-gzip dist-xz tar-ustar foreign subdir-objects])
 AC_PROG_SED
 
 AM_GNU_GETTEXT([external])
@@ -55,12 +57,26 @@ AC_DEFINE_UNQUOTED(GETTEXT_PACKAGE, "$PACKAGE", [gettext domain])
 AM_SILENT_RULES([yes])
 AM_MAINTAINER_MODE([enable])
 
-if test "x$GCC" = "xyes"; then
-  case " $CFLAGS " in
-  *[[\ \	]]-Wall[[\ \	]]*) ;;
-  *) CFLAGS="$CFLAGS -Wall" ;;
-  esac
-fi
+dnl This list is shared with https://github.com/ostreedev/ostree
+CC_CHECK_FLAGS_APPEND([WARN_CFLAGS], [CFLAGS], [\
+-pipe \
+-Wall \
+-Werror=empty-body \
+-Werror=strict-prototypes \
+-Werror=missing-prototypes \
+-Werror=implicit-function-declaration \
+"-Werror=format=2 -Werror=format-security -Werror=format-nonliteral" \
+-Werror=pointer-arith -Werror=init-self \
+-Werror=missing-declarations \
+-Werror=return-type \
+-Werror=overflow \
+-Werror=int-conversion \
+-Werror=parenthesis \
+-Werror=incompatible-pointer-types \
+-Werror=misleading-indentation \
+-Werror=missing-include-dirs \
+])
+AC_SUBST(WARN_CFLAGS)
 
 AX_VALGRIND_CHECK
 
@@ -108,6 +124,12 @@ AC_ARG_WITH(system_fonts_dir,
 SYSTEM_FONTS_DIR=$with_system_fonts_dir
 AC_SUBST(SYSTEM_FONTS_DIR)
 
+AC_ARG_WITH(system_font_cache_dirs,
+		AS_HELP_STRING([--with-system-font-cache-dirs=PATHS],[Directory where the system font cache is, [default=/var/cache/fontconfig:/usr/lib/fontconfig/cache]]),
+            with_system_font_cache_dirs="$withval", with_system_font_cache_dirs=/var/cache/fontconfig:/usr/lib/fontconfig/cache)
+SYSTEM_FONT_CACHE_DIRS=$with_system_font_cache_dirs
+AC_SUBST(SYSTEM_FONT_CACHE_DIRS)
+
 AC_ARG_WITH(profile_dir,
 		AS_HELP_STRING([--with-profile-dir=PATH],[choose directory for profile.d files, [default=SYSCONFDIR/profile.d]]),
             with_profile_dir="$withval", with_profile_dir=${sysconfdir}/profile.d)
@@ -129,7 +151,7 @@ AS_CASE([$BWRAP],
 if test "x$BWRAP" != xfalse; then
    BWRAP_VERSION=`$BWRAP --version | sed 's,.*\ \([0-9]*\.[0-9]*\.[0-9]*\)$,\1,'`
    AX_COMPARE_VERSION([$SYSTEM_BWRAP_REQS],[gt],[$BWRAP_VERSION],
-         AC_MSG_ERROR([You need at least version $SYSTEM_BWRAP_REQS of bubblewrap to use the system installed version]))
+                      [AC_MSG_ERROR([You need at least version $SYSTEM_BWRAP_REQS of bubblewrap to use the system installed version])])
    AM_CONDITIONAL([WITH_SYSTEM_BWRAP], [true])
 else
    AM_CONDITIONAL([WITH_SYSTEM_BWRAP], [false])
@@ -137,8 +159,8 @@ fi
 
 AC_CHECK_FUNCS(fdwalk)
 
-AC_CHECK_HEADER([sys/xattr.h], [], AC_MSG_ERROR([You must have sys/xattr.h from glibc]))
-AC_CHECK_HEADER([sys/capability.h], have_caps=yes, AC_MSG_ERROR([sys/capability.h header not found]))
+AC_CHECK_HEADER([sys/xattr.h], [], [AC_MSG_ERROR([You must have sys/xattr.h from glibc])])
+AC_CHECK_HEADER([sys/capability.h], have_caps=yes, [AC_MSG_ERROR([sys/capability.h header not found])])
 
 AC_SUBST([GLIB_MKENUMS], [`$PKG_CONFIG --variable glib_mkenums glib-2.0`])
 AC_SUBST([GLIB_COMPILE_RESOURCES], [`$PKG_CONFIG --variable glib_compile_resources gio-2.0`])
@@ -146,13 +168,23 @@ AC_SUBST([GDBUS_CODEGEN], [`$PKG_CONFIG --variable gdbus_codegen gio-2.0`])
 
 POLKIT_GOBJECT_REQUIRED=0.98
 
-PKG_CHECK_MODULES(BASE, [glib-2.0 >= $GLIB_REQS gio-2.0 gio-unix-2.0 libarchive >= 2.8.0])
+PKG_CHECK_MODULES(BASE, [glib-2.0 >= $GLIB_REQS gio-2.0 gio-unix-2.0 libarchive >= 2.8.0 libxml-2.0 >= 2.4 ])
 PKG_CHECK_MODULES(SOUP, [libsoup-2.4])
 
 save_LIBS=$LIBS
 LIBS=$BASE_LIBS
 AC_CHECK_FUNCS(archive_read_support_filter_all)
 LIBS=$save_LIBS
+
+LIBGPGME_DEPENDENCY="1.1.8"
+PKG_CHECK_MODULES(DEP_GPGME, gpgme-pthread >= $LIBGPGME_DEPENDENCY, have_gpgme=yes, [
+    m4_ifdef([AM_PATH_GPGME_PTHREAD], [
+       AM_PATH_GPGME_PTHREAD($LIBGPGME_DEPENDENCY, have_gpgme=yes, have_gpgme=no)
+    ],[ have_gpgme=no ])
+])
+AS_IF([ test x$have_gpgme = xno ], [
+   AC_MSG_ERROR([Need GPGME_PTHREAD version $LIBGPGME_DEPENDENCY or later])
+])
 
 AC_ARG_ENABLE([system-helper],
               AC_HELP_STRING([--disable-system-helper],
@@ -218,27 +250,27 @@ AC_ARG_ENABLE(sudo,
               [SUDO_BIN="sudo"], [SUDO_BIN=""])
 AC_SUBST([SUDO_BIN])
 
-dnl ************************
-dnl *** check for libelf ***
-dnl ************************
-PKG_CHECK_MODULES([LIBELF], [libelf >= 0.8.12], [have_libelf=yes], [have_libelf=maybe])
-AS_IF([ test $have_libelf = maybe ], [
-  save_LIBS=$LIBS
-  AC_CHECK_LIB([elf], [elf_begin], [:], [have_libelf=no])
-  AC_CHECK_LIB([elf], [elf_getshdrstrndx], [:], [have_libelf=no])
-  AC_CHECK_LIB([elf], [elf_getshdrnum], [:], [have_libelf=no])
-  AC_CHECK_HEADER([libelf.h], [:], [have_libelf=no])
-  LIBS=$save_LIBS
+# Do we enable building peer to peer support using libostree’s experimental (non-stable) API?
+# If so, OSTREE_ENABLE_EXPERIMENTAL_API needs to be #defined before ostree.h is
+# included.
+AC_ARG_ENABLE([p2p],
+  [AS_HELP_STRING([--enable-p2p],
+                  [Enable unstable peer to peer support [default=no]])],,
+  [enable_p2p=no])
+AS_IF([test x$enable_p2p = xyes],[
+  PKG_CHECK_MODULES(OSTREE, [ostree-1 >= $OSTREE_REQS])
 
-  if test $have_libelf != no; then
-    LIBELF_LIBS=-lelf
-    have_libelf=yes
-  fi
+  ostree_features=$($PKG_CONFIG --variable=features ostree-1)
+  AS_CASE(["$ostree_features"],
+          [*experimental*],[have_ostree_experimental=yes])
+
+  AS_IF([test "x$have_ostree_experimental" != "xyes"],
+        [AC_MSG_ERROR([Experimental API not found in ostree-1, which is needed for --enable-p2p. OSTree must be compiled with --enable-experimental-api.])])
+
+  AC_DEFINE([OSTREE_ENABLE_EXPERIMENTAL_API],[1],[Define if libostree experimental API should be enabled])
+  AC_DEFINE([FLATPAK_ENABLE_P2P],[1],[Define if peer to peer support should be enabled])
 ])
-
-if test x$have_libelf != xyes; then
-  AC_MSG_ERROR([libelf not found])
-fi
+AM_CONDITIONAL([ENABLE_P2P],[test x$enable_p2p = xyes])
 
 AC_ARG_WITH(system-install-dir,
            [AS_HELP_STRING([--with-system-install-dir=DIR],
@@ -247,25 +279,6 @@ AC_ARG_WITH(system-install-dir,
            [with_system_install_dir='$(localstatedir)/lib/flatpak'])
 SYSTEM_INSTALL_DIR=$with_system_install_dir
 AC_SUBST(SYSTEM_INSTALL_DIR)
-
-dnl This only checks for the header, not the library.
-AC_ARG_WITH([dwarf-header],
-            [AS_HELP_STRING([--with-dwarf-header],
-                            [path containing dwarf.h])],
-            [AS_IF([test "x$with_dwarf_header" = "xno"],
-                   [AC_MSG_WARN([either a path containing dwarf.h must be
-provided, or it will be searched for in includedir])])],
-            [with_dwarf_header=yes])
-
-AS_IF([test "x$with_dwarf_header" = "xyes"],
-      [CPPFLAGS="$CPPFLAGS -I$(eval echo \"$includedir\")/libdwarf -I/usr/include/libdwarf"
-       AC_CHECK_HEADER([dwarf.h])
-       AS_IF([test "x$ac_cv_header_dwarf_h" != "xyes"],
-             [AC_MSG_ERROR([dwarf.h is required but was not found; locate it using --with-dwarf-header=/path/containing/header])])],
-      [CPPFLAGS="$CPPFLAGS -I$with_dwarf_header"
-       AC_CHECK_HEADER([dwarf.h])
-       AS_IF([test "x$ac_cv_header_dwarf_h" != "xyes"],
-             [AC_MSG_ERROR([dwarf.h is required but was not found])])])
 
 AC_ARG_ENABLE(documentation,
               AC_HELP_STRING([--enable-documentation], [Build documentation]),,
@@ -376,6 +389,7 @@ GLIB_TESTS
 FLATPAK_MAJOR_VERSION=flatpak_major_version
 FLATPAK_MINOR_VERSION=flatpak_minor_version
 FLATPAK_MICRO_VERSION=flatpak_micro_version
+FLATPAK_EXTRA_VERSION=flatpak_extra_version
 FLATPAK_INTERFACE_AGE=flatpak_interface_age
 FLATPAK_VERSION=flatpak_version
 AC_SUBST(FLATPAK_MAJOR_VERSION)
@@ -386,6 +400,7 @@ AC_SUBST(FLATPAK_VERSION)
 AC_DEFINE_UNQUOTED([PACKAGE_MAJOR_VERSION], $FLATPAK_MAJOR_VERSION, [Major version])
 AC_DEFINE_UNQUOTED([PACKAGE_MINOR_VERSION], $FLATPAK_MINOR_VERSION, [Minor version])
 AC_DEFINE_UNQUOTED([PACKAGE_MICRO_VERSION], $FLATPAK_MICRO_VERSION, [Micro version])
+AC_DEFINE_UNQUOTED([PACKAGE_EXTRA_VERSION], $FLATPAK_EXTRA_VERSION, [Extra version])
 
 # libtool versioning
 #LT_RELEASE=$FLATPAK_MAJOR_VERSION.$FLATPAK_MINOR_VERSION
@@ -430,4 +445,5 @@ echo "          Use sandboxed triggers: $enable_sandboxed_triggers"
 echo "          Use seccomp:            $enable_seccomp"
 echo "          Privileged group:       $PRIVILEGED_GROUP"
 echo "          Privilege mode:         $with_priv_mode"
+echo "          Peer to peer support:   $enable_p2p"
 echo ""

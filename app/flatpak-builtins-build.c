@@ -39,6 +39,8 @@ static char *opt_build_dir;
 static char **opt_bind_mounts;
 static char *opt_sdk_dir;
 static char *opt_metadata;
+static gboolean opt_die_with_parent;
+static gboolean opt_with_appdir;
 
 static GOptionEntry options[] = {
   { "runtime", 'r', 0, G_OPTION_ARG_NONE, &opt_runtime, N_("Use Platform runtime rather than Sdk"), NULL },
@@ -46,6 +48,8 @@ static GOptionEntry options[] = {
   { "build-dir", 0, 0, G_OPTION_ARG_STRING, &opt_build_dir, N_("Start build in this directory"), N_("DIR") },
   { "sdk-dir", 0, 0, G_OPTION_ARG_STRING, &opt_sdk_dir, N_("Where to look for custom sdk dir (defaults to 'usr')"), N_("DIR") },
   { "metadata", 0, 0, G_OPTION_ARG_STRING, &opt_metadata, N_("Use alternative file for the metadata"), N_("FILE") },
+  { "die-with-parent", 'p', 0, G_OPTION_ARG_NONE, &opt_die_with_parent, N_("Kill processes when the parent process dies"), NULL },
+  { "with-appdir", 0, 0, G_OPTION_ARG_NONE, &opt_with_appdir, N_("Export application homedir directory to build"), NULL },
   { NULL }
 };
 
@@ -97,10 +101,13 @@ flatpak_builtin_build (int argc, char **argv, GCancellable *cancellable, GError 
   g_auto(GStrv) runtime_ref_parts = NULL;
   FlatpakRunFlags run_flags;
   const char *group = NULL;
+  const char *runtime_key = NULL;
   const char *dest = NULL;
   gboolean is_app = FALSE;
   gboolean is_extension = FALSE;
   gboolean is_app_extension = FALSE;
+  g_autofree char *app_info_path = NULL;
+  g_autoptr(GFile) app_id_dir = NULL;
 
   context = g_option_context_new (_("DIRECTORY [COMMAND [args...]] - Build in directory"));
   g_option_context_set_translation_domain (context, GETTEXT_PACKAGE);
@@ -145,19 +152,21 @@ flatpak_builtin_build (int argc, char **argv, GCancellable *cancellable, GError 
   if (!g_key_file_load_from_data (metakey, metadata_contents, metadata_size, 0, error))
     return FALSE;
 
-  if (g_key_file_has_group (metakey, "Application"))
+  if (g_key_file_has_group (metakey, FLATPAK_METADATA_GROUP_APPLICATION))
     {
-      group = "Application";
+      group = FLATPAK_METADATA_GROUP_APPLICATION;
       is_app = TRUE;
     }
-  else if (g_key_file_has_group (metakey, "Runtime"))
+  else if (g_key_file_has_group (metakey, FLATPAK_METADATA_GROUP_RUNTIME))
     {
-      group = "Runtime";
+      group = FLATPAK_METADATA_GROUP_RUNTIME;
     }
   else
     return flatpak_fail (error, _("metadata invalid, not application or runtime"));
 
-  extensionof_ref = g_key_file_get_string (metakey, "ExtensionOf", "ref", NULL);
+  extensionof_ref = g_key_file_get_string (metakey,
+                                           FLATPAK_METADATA_GROUP_EXTENSION_OF,
+                                           FLATPAK_METADATA_KEY_REF, NULL);
   if (extensionof_ref != NULL)
     {
       is_extension = TRUE;
@@ -166,11 +175,16 @@ flatpak_builtin_build (int argc, char **argv, GCancellable *cancellable, GError 
     }
 
 
-  id = g_key_file_get_string (metakey, group, "name", error);
+  id = g_key_file_get_string (metakey, group, FLATPAK_METADATA_KEY_NAME, error);
   if (id == NULL)
     return FALSE;
 
-  runtime = g_key_file_get_string (metakey, group, opt_runtime ? "runtime" : "sdk", error);
+  if (opt_runtime)
+    runtime_key = FLATPAK_METADATA_KEY_RUNTIME;
+  else
+    runtime_key = FLATPAK_METADATA_KEY_SDK;
+
+  runtime = g_key_file_get_string (metakey, group, runtime_key, error);
   if (runtime == NULL)
     return FALSE;
 
@@ -205,7 +219,11 @@ flatpak_builtin_build (int argc, char **argv, GCancellable *cancellable, GError 
   res_files = g_file_get_child (res_deploy, "files");
 
   if (is_app)
-    app_files = g_object_ref (res_files);
+    {
+      app_files = g_object_ref (res_files);
+      if (opt_with_appdir)
+        app_id_dir = flatpak_ensure_data_dir (id, cancellable, NULL);
+    }
   else if (is_extension)
     {
       g_autoptr(GKeyFile) x_metakey = NULL;
@@ -221,7 +239,7 @@ flatpak_builtin_build (int argc, char **argv, GCancellable *cancellable, GError 
 
       x_metakey = flatpak_deploy_get_metadata (extensionof_deploy);
 
-      x_group = g_strdup_printf ("Extension %s", id);
+      x_group = g_strconcat (FLATPAK_METADATA_GROUP_PREFIX_EXTENSION, id, NULL);
       if (!g_key_file_has_group (x_metakey, x_group))
         {
           /* Failed, look for subdirectories=true parent */
@@ -231,8 +249,11 @@ flatpak_builtin_build (int argc, char **argv, GCancellable *cancellable, GError 
             {
               char *parent_id = g_strndup (id, last_dot - id);
               g_free (x_group);
-              x_group = g_strdup_printf ("Extension %s", parent_id);
-              if (g_key_file_get_boolean (x_metakey, x_group, "subdirectories", NULL))
+              x_group = g_strconcat (FLATPAK_METADATA_GROUP_PREFIX_EXTENSION,
+                                     parent_id, NULL);
+              if (g_key_file_get_boolean (x_metakey, x_group,
+                                          FLATPAK_METADATA_KEY_SUBDIRECTORIES,
+                                          NULL))
                 x_subdir = last_dot + 1;
             }
 
@@ -240,12 +261,14 @@ flatpak_builtin_build (int argc, char **argv, GCancellable *cancellable, GError 
             return flatpak_fail (error, _("No extension point matching %s in %s"), id, extensionof_ref);
         }
 
-      x_dir = g_key_file_get_string (x_metakey, x_group, "directory", error);
+      x_dir = g_key_file_get_string (x_metakey, x_group,
+                                     FLATPAK_METADATA_KEY_DIRECTORY, error);
       if (x_dir == NULL)
         return FALSE;
 
       x_subdir_suffix = g_key_file_get_string (x_metakey, x_group,
-                                               "subdirectory-suffix", NULL);
+                                               FLATPAK_METADATA_KEY_SUBDIRECTORY_SUFFIX,
+                                               NULL);
 
       if (is_app_extension)
         {
@@ -268,21 +291,25 @@ flatpak_builtin_build (int argc, char **argv, GCancellable *cancellable, GError 
   argv_array = g_ptr_array_new_with_free_func (g_free);
   g_ptr_array_add (argv_array, g_strdup (flatpak_get_bwrap ()));
 
-  custom_usr = FALSE;
-  usr = g_file_get_child (res_deploy,  opt_sdk_dir ? opt_sdk_dir : "usr");
-  if (g_file_query_exists (usr, cancellable))
-    {
-      custom_usr = TRUE;
-      runtime_files = g_object_ref (usr);
-    }
-  else
-    runtime_files = flatpak_deploy_get_files (runtime_deploy);
-
-  run_flags = FLATPAK_RUN_FLAG_DEVEL | FLATPAK_RUN_FLAG_NO_SESSION_HELPER;
+  run_flags =
+    FLATPAK_RUN_FLAG_DEVEL | FLATPAK_RUN_FLAG_NO_SESSION_HELPER |
+    FLATPAK_RUN_FLAG_SET_PERSONALITY | FLATPAK_RUN_FLAG_NO_A11Y_BUS_PROXY;
+  if (opt_die_with_parent)
+    run_flags |= FLATPAK_RUN_FLAG_DIE_WITH_PARENT;
   if (custom_usr)
     run_flags |= FLATPAK_RUN_FLAG_WRITABLE_ETC;
 
-  if (!flatpak_run_setup_base_argv (argv_array, NULL, runtime_files, NULL, runtime_ref_parts[2],
+  /* Unless manually specified, we disable dbus proxy */
+  if (!flatpak_context_get_needs_session_bus_proxy (arg_context))
+    run_flags |= FLATPAK_RUN_FLAG_NO_SESSION_BUS_PROXY;
+
+  if (!flatpak_context_get_needs_system_bus_proxy (arg_context))
+    run_flags |= FLATPAK_RUN_FLAG_NO_SYSTEM_BUS_PROXY;
+
+  /* Never set up an a11y bus for builds */
+  run_flags |= FLATPAK_RUN_FLAG_NO_A11Y_BUS_PROXY;
+
+  if (!flatpak_run_setup_base_argv (argv_array, NULL, runtime_files, app_id_dir, runtime_ref_parts[2],
                                     run_flags, error))
     return FALSE;
 
@@ -325,19 +352,12 @@ flatpak_builtin_build (int argc, char **argv, GCancellable *cancellable, GError 
             "--setenv", "FLATPAK_DEST", dest,
             NULL);
 
-  /* After setup_base to avoid conflicts with /var symlinks */
-  add_args (argv_array,
-            "--bind", flatpak_file_get_path_cached (var), "/var",
-            NULL);
-
-  app_context = flatpak_context_new ();
-  if (runtime_metakey)
-    {
-      if (!flatpak_context_load_metadata (app_context, runtime_metakey, error))
-        return FALSE;
-    }
-  if (!flatpak_context_load_metadata (app_context, metakey, error))
+  app_context = flatpak_app_compute_permissions (metakey,
+                                                 runtime_metakey,
+                                                 error);
+  if (app_context == NULL)
     return FALSE;
+
   flatpak_context_allow_host_fs (app_context);
   flatpak_context_merge (app_context, arg_context);
 
@@ -348,7 +368,7 @@ flatpak_builtin_build (int argc, char **argv, GCancellable *cancellable, GError 
                                       id, NULL,
                                       runtime_ref,
                                       app_context,
-                                      NULL,
+                                      &app_info_path,
                                       error))
     return FALSE;
 
@@ -359,8 +379,14 @@ flatpak_builtin_build (int argc, char **argv, GCancellable *cancellable, GError 
       !flatpak_run_add_extension_args (argv_array, &envp, runtime_metakey, runtime_ref, cancellable, error))
     return FALSE;
 
-  flatpak_run_add_environment_args (argv_array, NULL, &envp, NULL, NULL, id,
-                                    app_context, NULL);
+  if (!flatpak_run_add_environment_args (argv_array, NULL, &envp, app_info_path, run_flags, id,
+                                         app_context, app_id_dir, NULL, cancellable, error))
+    return FALSE;
+
+  /* After setup_base to avoid conflicts with /var symlinks */
+  add_args (argv_array,
+            "--bind", flatpak_file_get_path_cached (var), "/var",
+            NULL);
 
   for (i = 0; opt_bind_mounts != NULL && opt_bind_mounts[i] != NULL; i++)
     {

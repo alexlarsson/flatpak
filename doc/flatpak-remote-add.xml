@@ -110,7 +110,7 @@
 
                 <listitem><para>
                     Modify a system-wide installation specified by <arg choice="plain">NAME</arg>
-                    among those defined in <filename>/etc/flatpak/installations.d</filename>.
+                    among those defined in <filename>/etc/flatpak/installations.d/</filename>.
                     Using <arg choice="plain">--installation=default</arg> is equivalent to using
                     <arg choice="plain">--system</arg>.
                 </para></listitem>
@@ -180,7 +180,7 @@
                 <term><option>--default-branch=BRANCH</option></term>
 
                 <listitem><para>
-                    A default branch to for the remote, mainly for use in a UI.
+                    A default branch for the remote, mainly for use in a UI.
                 </para></listitem>
             </varlistentry>
 
@@ -191,6 +191,15 @@
                      Import gpg keys from the specified keyring file as
                      trusted for the new remote. If the file is - the
                      keyring is read from standard input.
+                </para></listitem>
+            </varlistentry>
+
+            <varlistentry>
+                <term><option>--oci</option></term>
+
+                <listitem><para>
+                    This is a OCI format registry rather than a regular
+                    flatpak repository.
                 </para></listitem>
             </varlistentry>
 

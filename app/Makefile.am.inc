@@ -31,13 +31,13 @@ flatpak_SOURCES = \
 	app/flatpak-builtins-build-commit-from.c \
 	app/flatpak-builtins-build-sign.c \
 	app/flatpak-builtins-repo-update.c \
+	app/flatpak-builtins-repo.c \
 	app/flatpak-builtins-document-export.c \
 	app/flatpak-builtins-document-unexport.c \
 	app/flatpak-builtins-document-info.c \
 	app/flatpak-builtins-document-list.c \
-	$(xdp_dbus_built_sources)	\
 	$(NULL)
 
-flatpak_LDADD = $(BASE_LIBS) $(OSTREE_LIBS) $(SOUP_LIBS) $(JSON_LIBS) libglnx.la libflatpak-common.la
-flatpak_CFLAGS = $(BASE_CFLAGS) $(OSTREE_CFLAGS) $(SOUP_CFLAGS) $(JSON_CFLAGS) \
+flatpak_LDADD = $(AM_LDADD) $(BASE_LIBS) $(OSTREE_LIBS) $(SOUP_LIBS) $(JSON_LIBS) libglnx.la libflatpak-common.la
+flatpak_CFLAGS = $(AM_CFLAGS) $(BASE_CFLAGS) $(OSTREE_CFLAGS) $(SOUP_CFLAGS) $(JSON_CFLAGS) \
         -DLOCALEDIR=\"$(localedir)\"
