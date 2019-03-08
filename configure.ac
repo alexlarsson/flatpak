@@ -289,6 +289,17 @@ if test "x$enable_seccomp" = "xyes"; then
       [Define if using seccomp])
 fi
 
+AC_ARG_ENABLE([sandboxed-proc],
+              AC_HELP_STRING([--disable-sandboxed-proc],
+                             [Disable sandboxed /proc (needed in docker)]),
+              [],
+              [enable_sandboxed_proc=yes])
+
+if test "x$enable_sandboxed_proc" = "xno"; then
+   AC_DEFINE([DISABLE_SANDBOXED_PROC], [1],
+      [Define if not using sandboxed /proc])
+fi
+
 AC_ARG_WITH(priv-mode,
             AS_HELP_STRING([--with-priv-mode=setuid/none],
                            [How to set privilege-raising during install (only needed if userns not working)]),

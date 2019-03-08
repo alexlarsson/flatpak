@@ -180,7 +180,11 @@ rerun_in_sandbox (const char *arg_width,
 
   add_args (args,
             "--tmpfs", "/tmp",
+#ifdef DISABLE_SANDBOXED_PROC
+            "--bind", "/proc", "/proc",
+#else
             "--proc", "/proc",
+#endif
             "--dev", "/dev",
             "--chdir", "/",
             "--setenv", "GIO_USE_VFS", "local",

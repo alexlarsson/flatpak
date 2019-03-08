@@ -2702,7 +2702,11 @@ flatpak_run_setup_base_argv (FlatpakBwrap   *bwrap,
 
   if ((flags & FLATPAK_RUN_FLAG_NO_PROC) == 0)
     flatpak_bwrap_add_args (bwrap,
+#ifdef DISABLE_SANDBOXED_PROC
+                            "--bind", "/proc", "/proc",
+#else
                             "--proc", "/proc",
+#endif
                             NULL);
 
   flatpak_bwrap_add_args (bwrap,
@@ -3099,7 +3103,11 @@ regenerate_ld_cache (GPtrArray    *base_argv_array,
                           "--unshare-pid",
                           "--unshare-ipc",
                           "--unshare-net",
+#ifdef DISABLE_SANDBOXED_PROC
+                          "--bind", "/proc", "/proc",
+#else
                           "--proc", "/proc",
+#endif
                           "--dev", "/dev",
                           "--bind", flatpak_file_get_path_cached (ld_so_dir), "/run/ld-so-cache-dir",
                           NULL);
