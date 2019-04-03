@@ -370,12 +370,10 @@ handle_deploy (FlatpakSystemHelper   *object,
   if (ongoing_pull != NULL)
     {
       g_autoptr(GError) local_error = NULL;
-      gint dir_fd = -1;
 
       terminate_revokefs_backend (ongoing_pull);
 
-      dir_fd = open (ongoing_pull->src_dir, O_DIRECTORY);
-      if (!flatpak_canonicalize_permissions (dir_fd,
+      if (!flatpak_canonicalize_permissions (AT_FDCWD,
                                              arg_repo_path,
                                              getuid() == 0 ? 0 : -1,
                                              getuid() == 0 ? 0 : -1,
