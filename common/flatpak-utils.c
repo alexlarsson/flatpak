@@ -2863,6 +2863,394 @@ flatpak_repo_collect_extra_data_sizes (OstreeRepo *repo,
     }
 }
 
+#define _LOOSE_PATH_MAX (256)
+
+static void
+get_extra_commitmeta_path (const char *commit,
+                           char *path_buf,
+                           gsize path_buf_len)
+{
+  snprintf (path_buf, path_buf_len,
+            "objects/%c%c/%s.commitmeta2",
+            commit[0], commit[1], commit + 2);
+}
+
+static gboolean
+load_extra_commitmeta (OstreeRepo       *repo,
+                       const char       *commit,
+                       GVariant        **out_variant,
+                       GCancellable     *cancellable,
+                       GError          **error)
+{
+  char loose_path_buf[_LOOSE_PATH_MAX];
+  glnx_autofd int fd = -1;
+  g_autoptr(GVariant) ret_variant = NULL;
+  g_autoptr(GError) temp_error = NULL;
+
+  get_extra_commitmeta_path (commit, loose_path_buf, sizeof (loose_path_buf));
+
+  if (!glnx_openat_rdonly (ostree_repo_get_dfd (repo), loose_path_buf, FALSE, &fd, &temp_error) &&
+      !g_error_matches (temp_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
+    {
+      g_propagate_error (error, temp_error);
+      return FALSE;
+    }
+
+  if (fd != -1)
+    {
+      g_autoptr(GBytes) content = glnx_fd_readall_bytes (fd, cancellable, error);
+      if (!content)
+        return FALSE;
+      ret_variant = g_variant_ref_sink (g_variant_new_from_bytes (G_VARIANT_TYPE ("a{sv}"), content, TRUE));
+    }
+
+  *out_variant = g_steal_pointer (&ret_variant);
+  return TRUE;
+}
+
+static gboolean
+save_extra_commitmeta (OstreeRepo       *repo,
+                       const char       *commit,
+                       GVariant         *variant,
+                       GCancellable     *cancellable,
+                       GError          **error)
+{
+  char loose_path_buf[_LOOSE_PATH_MAX];
+
+  get_extra_commitmeta_path (commit, loose_path_buf, sizeof (loose_path_buf));
+
+  if (!glnx_file_replace_contents_at (ostree_repo_get_dfd (repo), loose_path_buf,
+                                      g_variant_get_data (variant),
+                                      g_variant_get_size (variant),
+                                      GLNX_FILE_REPLACE_DATASYNC_NEW,
+                                      cancellable, error))
+    return FALSE;
+
+  return TRUE;
+}
+
+static gboolean
+remove_extra_commitmeta (OstreeRepo       *repo,
+                         const char       *commit,
+                         GCancellable     *cancellable,
+                         GError          **error)
+{
+  char loose_path_buf[_LOOSE_PATH_MAX];
+
+  get_extra_commitmeta_path (commit, loose_path_buf, sizeof (loose_path_buf));
+
+  /* Ignore errors */
+  (void) unlinkat (ostree_repo_get_dfd (repo), loose_path_buf, 0);
+
+  return TRUE;
+}
+
+typedef struct {
+  OstreeRepo *repo;
+  GHashTable *reachable;
+  guint n_reachable_meta;
+  guint n_reachable_content;
+  guint n_unreachable_meta;
+  guint n_unreachable_content;
+  guint64 freed_bytes;
+} OtPruneData;
+
+static gboolean
+maybe_prune_loose_object (OtPruneData          *data,
+                          GVariant             *obj_name,
+                          gboolean              dont_prune,
+                          GCancellable         *cancellable,
+                          GError              **error)
+{
+  gboolean reachable = FALSE;
+  g_autoptr(GVariant) key = NULL;
+  VarObjectNameRef obj_name_ref = var_object_name_from_gvariant ((GVariant *)obj_name);
+  const char *checksum = var_object_name_get_checksum (obj_name_ref);
+  OstreeObjectType objtype = var_object_name_get_objtype (obj_name_ref);
+
+  if (g_hash_table_lookup_extended (data->reachable, obj_name, NULL, NULL))
+    reachable = TRUE;
+  else
+    {
+      guint64 storage_size = 0;
+
+      g_debug ("Pruning unneeded object %s.%s", checksum,
+               ostree_object_type_to_string (objtype));
+
+      if (!ostree_repo_query_object_storage_size (data->repo, objtype, checksum,
+                                                  &storage_size, cancellable, error))
+        return FALSE;
+
+      data->freed_bytes += storage_size;
+
+      if (!dont_prune)
+        {
+          if (objtype == OSTREE_OBJECT_TYPE_COMMIT)
+            {
+              if (!remove_extra_commitmeta (data->repo, checksum, cancellable, error))
+                return FALSE;
+
+              if (!ostree_repo_mark_commit_partial (data->repo, checksum, FALSE, error))
+                return FALSE;
+            }
+
+          if (!ostree_repo_delete_object (data->repo, objtype, checksum,
+                                          cancellable, error))
+            return FALSE;
+        }
+
+      if (OSTREE_OBJECT_TYPE_IS_META (objtype))
+        data->n_unreachable_meta++;
+      else
+        data->n_unreachable_content++;
+    }
+
+  if (reachable)
+    {
+      g_debug ("Keeping needed object %s.%s", checksum,
+               ostree_object_type_to_string (objtype));
+      if (OSTREE_OBJECT_TYPE_IS_META (objtype))
+        data->n_reachable_meta++;
+      else
+        data->n_reachable_content++;
+    }
+
+  return TRUE;
+}
+
+static gboolean
+traverse_commit_parents (OstreeRepo      *repo,
+                         const char      *commit_checksum,
+                         int              maxdepth,
+                         GHashTable      *inout_checksums,
+                         GCancellable    *cancellable,
+                         GError         **error)
+{
+  g_autofree char *tmp_checksum = NULL;
+
+  while (TRUE)
+    {
+      g_autoptr(GVariant) commit = NULL;
+
+      if (!ostree_repo_load_variant_if_exists (repo, OSTREE_OBJECT_TYPE_COMMIT,
+                                               commit_checksum, &commit,
+                                               error))
+        return FALSE;
+
+      /* Just return if the parent isn't found; we do expect most
+       * people to have partial repositories.
+       */
+      if (commit == NULL)
+        break;
+
+      g_hash_table_add (inout_checksums, g_strdup (commit_checksum));
+
+      gboolean recurse = FALSE;
+      if (maxdepth == -1 || maxdepth > 0)
+        {
+          g_free (tmp_checksum);
+          tmp_checksum = ostree_commit_get_parent (commit);
+          if (tmp_checksum)
+            {
+              commit_checksum = tmp_checksum;
+              if (maxdepth > 0)
+                maxdepth -= 1;
+              recurse = TRUE;
+            }
+        }
+      if (!recurse)
+        break;
+    }
+
+  return TRUE;
+}
+
+static guint
+_ostree_object_name_hash (gconstpointer a)
+{
+  VarObjectNameRef ref = var_object_name_from_gvariant ((GVariant *)a);
+
+  return g_str_hash (var_object_name_get_checksum (ref)) + (guint)var_object_name_get_objtype (ref);
+}
+
+static gboolean
+_ostree_object_name_equal (gconstpointer a,
+                           gconstpointer b)
+{
+  VarObjectNameRef ref_a = var_object_name_from_gvariant ((GVariant *)a);
+  VarObjectNameRef ref_b = var_object_name_from_gvariant ((GVariant *)a);
+
+  return
+    g_str_equal (var_object_name_get_checksum (ref_a), var_object_name_get_checksum (ref_b)) &&
+    var_object_name_get_objtype (ref_a) == var_object_name_get_objtype (ref_b);
+}
+
+static GHashTable *
+reachable_commits_new (void)
+{
+  return g_hash_table_new_full (_ostree_object_name_hash, _ostree_object_name_equal,
+                                NULL, (GDestroyNotify)g_variant_unref);
+}
+
+static gboolean
+traverse_reachable_refs (OstreeRepo *repo,
+                         guint       depth,
+                         GHashTable *reachable,
+                         GCancellable *cancellable,
+                         GError      **error)
+{
+  g_autoptr(GHashTable) all_refs = NULL;  /* (element-type utf8 utf8) */
+  g_autoptr(GHashTable) all_collection_refs = NULL;  /* (element-type OstreeChecksumRef utf8) */
+  g_autoptr(GHashTable) checksums = NULL;  /* (element-type const char *) */
+
+  checksums = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+
+  /* Get all commits up to depth from the regular refs */
+  if (!ostree_repo_list_refs (repo, NULL, &all_refs,
+                              cancellable, error))
+    return FALSE;
+
+  GLNX_HASH_TABLE_FOREACH_V (all_refs, const char*, checksum)
+    {
+      if (!traverse_commit_parents (repo, checksum, depth, checksums, cancellable, error))
+        return FALSE;
+    }
+
+  /* Get all commits up to depth from the collection refs */
+  if (!ostree_repo_list_collection_refs (repo, NULL, &all_collection_refs,
+                                         OSTREE_REPO_LIST_REFS_EXT_EXCLUDE_REMOTES, cancellable, error))
+    return FALSE;
+
+  GLNX_HASH_TABLE_FOREACH_V (all_collection_refs, const char*, checksum)
+    {
+      if (!traverse_commit_parents (repo, checksum, depth, checksums, cancellable, error))
+        return FALSE;
+    }
+
+  /* Find reachable objects from each commit checksum */
+  GLNX_HASH_TABLE_FOREACH_V (checksums, const char*, checksum)
+    {
+      g_autoptr(GVariant) extra_commitmeta = NULL;
+      g_auto(GVariantDict) extra_metadata_builder = FLATPAK_VARIANT_BUILDER_INITIALIZER;
+      g_autoptr(GVariant) commit_reachable_va = NULL;
+      GVariant *commit_reachable_v;
+      GVariantIter iter;
+
+      g_debug ("Finding objects to keep for commit %s", checksum);
+
+      if (!load_extra_commitmeta (repo, checksum, &extra_commitmeta, cancellable, error))
+        return FALSE;
+
+      if (extra_commitmeta)
+        {
+          commit_reachable_va = g_variant_lookup_value (extra_commitmeta, "xa.reachable", G_VARIANT_TYPE ("a(su)"));
+        }
+
+      if (commit_reachable_va == NULL)
+        {
+          g_autoptr(GVariantBuilder) reachable_builder = g_variant_builder_new (G_VARIANT_TYPE ("a(su)"));
+          g_autoptr(GHashTable) commit_reachable = reachable_commits_new ();
+          g_autoptr(GVariant) new_extra_commitmeta = NULL;
+          g_auto(GVariantDict) extra_commitmeta_builder = FLATPAK_VARIANT_BUILDER_INITIALIZER;
+
+          if (!ostree_repo_traverse_commit_union (repo, checksum, 0, commit_reachable,
+                                                  cancellable, error))
+            return FALSE;
+
+          GLNX_HASH_TABLE_FOREACH_V (commit_reachable, GVariant *, reachable_commit)
+            {
+              g_variant_builder_add_value (reachable_builder, reachable_commit);
+            }
+
+          commit_reachable_va = g_variant_ref_sink (g_variant_builder_end (reachable_builder));
+
+          g_variant_dict_init (&extra_commitmeta_builder, extra_commitmeta);
+          g_variant_dict_insert_value (&extra_commitmeta_builder, "xa.reachable", commit_reachable_va);
+
+          new_extra_commitmeta = g_variant_ref_sink (g_variant_dict_end (&extra_commitmeta_builder));
+          if (!save_extra_commitmeta (repo, checksum, new_extra_commitmeta, cancellable, error))
+            return FALSE;
+        }
+
+      g_variant_iter_init (&iter, commit_reachable_va);
+      while ((commit_reachable_v = g_variant_iter_next_value (&iter)))
+        g_hash_table_add (reachable, commit_reachable_v); /* Takes ownership */
+
+    }
+
+  return TRUE;
+}
+
+
+/* This is a custom implementation of ostree-prune that caches the
+ * traversal for better performance on larger repos. */
+gboolean
+flatpak_repo_prune (OstreeRepo    *repo,
+                    int            depth,
+                    int           *out_objects_total,
+                    int           *out_objects_pruned,
+                    guint64       *out_pruned_object_size_total,
+                    GCancellable  *cancellable,
+                    GError       **error)
+{
+  g_autoptr(GHashTable) objects = NULL;
+  g_autoptr(GHashTable) reachable = reachable_commits_new ();
+  OtPruneData data = { 0, };
+  gboolean dont_prune = TRUE; /* TODO: enable prune */
+
+  /* This version only handles archive repos, if called for something else call ostree */
+  if (ostree_repo_get_mode (repo) != OSTREE_REPO_MODE_ARCHIVE)
+    {
+      return ostree_repo_prune (repo, 0, depth,
+                                out_objects_total, out_objects_pruned, out_pruned_object_size_total,
+                                cancellable, error);
+    }
+
+  {
+    /* Custom exclusive lock in this region */
+#if 0
+    /* TODO: Actually get an exclusive lock. Its not public API so we have to do something else... */
+    g_autoptr(OstreeRepoAutoLock) lock =
+      _ostree_repo_auto_lock_push (repo, OSTREE_REPO_LOCK_EXCLUSIVE, cancellable, error);
+    if (!lock)
+      return FALSE;
+#endif
+
+    if (!traverse_reachable_refs (repo, depth, reachable, cancellable, error))
+      return FALSE;
+
+    if (!ostree_repo_list_objects (repo, OSTREE_REPO_LIST_OBJECTS_ALL | OSTREE_REPO_LIST_OBJECTS_NO_PARENTS,
+                                   &objects, cancellable, error))
+      return FALSE;
+
+    data.repo = repo;
+    /* We unref this when we're done */
+    g_autoptr(GHashTable) reachable_owned = g_hash_table_ref (reachable);
+    data.reachable = reachable_owned;
+
+    GLNX_HASH_TABLE_FOREACH_KV (objects, GVariant*, obj_name, GVariant*, objdata)
+      {
+        VarObjectListInfoRef obj_info = var_object_list_info_from_gvariant ((GVariant *)objdata);
+
+        if (!var_object_list_info_get_is_loose (obj_info))
+          continue;
+
+        if (!maybe_prune_loose_object (&data, obj_name, dont_prune, cancellable, error))
+          return FALSE;
+      }
+  }
+
+  /* Prune static deltas outside lock, to avoid conflict with its exclusive lock */
+  if (!dont_prune && !ostree_repo_prune_static_deltas (repo, NULL, cancellable, error))
+    return FALSE;
+
+  *out_objects_total = (data.n_reachable_meta + data.n_unreachable_meta +
+                        data.n_reachable_content + data.n_unreachable_content);
+  *out_objects_pruned = (data.n_unreachable_meta + data.n_unreachable_content);
+  *out_pruned_object_size_total = data.freed_bytes;
+  return TRUE;
+}
+
 /* Loads the old compat summary file from a local repo */
 GVariant *
 flatpak_repo_load_summary (OstreeRepo *repo,

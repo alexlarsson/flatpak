@@ -171,6 +171,13 @@ gboolean flatpak_variant_save (GFile        *dest,
                                GVariant     *variant,
                                GCancellable *cancellable,
                                GError      **error);
+gboolean flatpak_repo_prune  (OstreeRepo    *repo,
+                              int            depth,
+                              int           *out_objects_total,
+                              int           *out_objects_pruned,
+                              guint64       *out_pruned_object_size_total,
+                              GCancellable  *cancellable,
+                              GError       **error);
 GVariant *flatpak_repo_load_summary (OstreeRepo *repo,
                                      GError    **error);
 GVariant *flatpak_repo_load_summary_index (OstreeRepo *repo,
