@@ -3197,6 +3197,7 @@ flatpak_repo_prune (OstreeRepo    *repo,
   g_autoptr(GHashTable) reachable = reachable_commits_new ();
   OtPruneData data = { 0, };
   gboolean dont_prune = TRUE; /* TODO: enable prune */
+  g_autoptr(GTimer) timer = NULL;
 
   /* This version only handles archive repos, if called for something else call ostree */
   if (ostree_repo_get_mode (repo) != OSTREE_REPO_MODE_ARCHIVE)
@@ -3216,12 +3217,28 @@ flatpak_repo_prune (OstreeRepo    *repo,
       return FALSE;
 #endif
 
+    timer = g_timer_new ();
+    g_print ("Finding reachable objects (depth=%d)\n", depth);
+    g_timer_start (timer);
+
     if (!traverse_reachable_refs (repo, depth, reachable, cancellable, error))
       return FALSE;
+
+    g_timer_stop (timer);
+    g_print ("Elapsed time: %.1f sec\n",  g_timer_elapsed (timer, NULL));
+
+    g_print ("Listing all objects\n");
+    g_timer_start (timer);
 
     if (!ostree_repo_list_objects (repo, OSTREE_REPO_LIST_OBJECTS_ALL | OSTREE_REPO_LIST_OBJECTS_NO_PARENTS,
                                    &objects, cancellable, error))
       return FALSE;
+
+    g_timer_stop (timer);
+    g_print ("Elapsed time: %.1f sec\n",  g_timer_elapsed (timer, NULL));
+
+    g_print ("Computing unreachable objects\n");
+    g_timer_start (timer);
 
     data.repo = repo;
     /* We unref this when we're done */
@@ -3238,6 +3255,9 @@ flatpak_repo_prune (OstreeRepo    *repo,
         if (!maybe_prune_loose_object (&data, obj_name, dont_prune, cancellable, error))
           return FALSE;
       }
+
+    g_timer_stop (timer);
+    g_print ("Elapsed time: %.1f sec\n",  g_timer_elapsed (timer, NULL));
   }
 
   /* Prune static deltas outside lock, to avoid conflict with its exclusive lock */
