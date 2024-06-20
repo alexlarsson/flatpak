@@ -91,10 +91,8 @@ struct FlatpakContext
 {
   FlatpakContextShares   shares;
   FlatpakContextShares   shares_valid;
-  FlatpakContextSockets  sockets;
-  FlatpakContextSockets  sockets_valid;
-  FlatpakContextDevices  devices;
-  FlatpakContextDevices  devices_valid;
+  GHashTable            *socket_permissions;
+  GHashTable            *device_permissions;
   FlatpakContextFeatures features;
   FlatpakContextFeatures features_valid;
   GHashTable            *env_vars;
@@ -210,5 +208,17 @@ gboolean flatpak_context_get_allowed_exports (FlatpakContext *context,
                                               char         ***allowed_extensions_out,
                                               char         ***allowed_prefixes_out,
                                               gboolean       *require_exact_match_out);
+
+
+gboolean              flatpak_context_compute_allowed_socket  (FlatpakContext                   *context,
+                                                               FlatpakContextConditionEvaluator  evaluator,
+                                                               const char                       *name);
+FlatpakContextSockets flatpak_context_compute_allowed_sockets (FlatpakContext                   *context,
+                                                               FlatpakContextConditionEvaluator  evaluator);
+gboolean              flatpak_context_compute_allowed_device  (FlatpakContext                   *context,
+                                                               FlatpakContextConditionEvaluator  evaluator,
+                                                               const char                       *name);
+FlatpakContextDevices flatpak_context_compute_allowed_devices (FlatpakContext                   *context,
+                                                               FlatpakContextConditionEvaluator  evaluator);
 
 #endif /* __FLATPAK_CONTEXT_H__ */

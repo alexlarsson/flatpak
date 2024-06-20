@@ -234,6 +234,7 @@ create_proxy_socket (const char *template)
 gboolean
 flatpak_run_add_session_dbus_args (FlatpakBwrap   *app_bwrap,
                                    FlatpakBwrap   *proxy_arg_bwrap,
+                                   FlatpakContextSockets sockets,
                                    FlatpakContext *context,
                                    FlatpakRunFlags flags,
                                    const char     *app_id)
@@ -244,7 +245,7 @@ flatpak_run_add_session_dbus_args (FlatpakBwrap   *app_bwrap,
   const char *dbus_address = g_getenv ("DBUS_SESSION_BUS_ADDRESS");
   g_autofree char *dbus_session_socket = NULL;
 
-  unrestricted = (context->sockets & FLATPAK_CONTEXT_SOCKET_SESSION_BUS) != 0;
+  unrestricted = (sockets & FLATPAK_CONTEXT_SOCKET_SESSION_BUS) != 0;
 
   if (dbus_address != NULL)
     {
@@ -316,6 +317,7 @@ flatpak_run_add_session_dbus_args (FlatpakBwrap   *app_bwrap,
 gboolean
 flatpak_run_add_system_dbus_args (FlatpakBwrap   *app_bwrap,
                                   FlatpakBwrap   *proxy_arg_bwrap,
+                                  FlatpakContextSockets sockets,
                                   FlatpakContext *context,
                                   FlatpakRunFlags flags)
 {
@@ -324,7 +326,7 @@ flatpak_run_add_system_dbus_args (FlatpakBwrap   *app_bwrap,
   g_autofree char *real_dbus_address = NULL;
   g_autofree char *dbus_system_socket = NULL;
 
-  unrestricted = (context->sockets & FLATPAK_CONTEXT_SOCKET_SYSTEM_BUS) != 0;
+  unrestricted = (sockets & FLATPAK_CONTEXT_SOCKET_SYSTEM_BUS) != 0;
   if (unrestricted)
     g_info ("Allowing system-dbus access");
 
